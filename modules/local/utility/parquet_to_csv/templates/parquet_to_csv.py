@@ -5,14 +5,10 @@ Convert a Parquet file to CSV format.
 Reads a Parquet file and writes it as CSV, optionally gzip-compressed.
 """
 
+import argparse
 from pathlib import Path
 
 import pandas as pd
-
-# Nextflow-injected variables
-TRANSCRIPTS = "${transcripts}"
-EXTENSION = "${extension}"
-PREFIX = "${prefix}"
 
 
 def convert_parquet(
@@ -42,9 +38,33 @@ def convert_parquet(
     return None
 
 
+def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Convert a Parquet file to CSV format."
+    )
+    parser.add_argument(
+        "--transcripts",
+        required=True,
+        help="Input parquet filename",
+    )
+    parser.add_argument(
+        "--extension",
+        default=".csv",
+        help="Output extension: '.csv' or '.gz' (default: .csv)",
+    )
+    parser.add_argument(
+        "--prefix",
+        required=True,
+        help="Output directory prefix (sample ID)",
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
+    args = parse_args()
     convert_parquet(
-        transcripts=TRANSCRIPTS,
-        extension=EXTENSION,
-        prefix=PREFIX,
+        transcripts=args.transcripts,
+        extension=args.extension,
+        prefix=args.prefix,
     )

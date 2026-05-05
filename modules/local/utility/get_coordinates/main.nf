@@ -24,7 +24,10 @@ process GET_TRANSCRIPTS_COORDINATES {
 
     prefix = task.ext.prefix ?: "${meta.id}"
 
-    template 'get_coordinates.py'
+    """
+    python3 ${moduleDir}/templates/get_coordinates.py \\
+        --transcripts ${transcripts}
+    """
 
     stub:
     // Exit if running this module with -profile conda / -profile mamba

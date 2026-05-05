@@ -23,9 +23,15 @@ process SPLIT_TRANSCRIPTS {
     if (workflow.profile.tokenize(',').intersect(['conda', 'mamba']).size() >= 1) {
         error "SPLIT_TRANSCRIPTS module does not support Conda. Please use Docker / Singularity / Podman instead."
     }
-    prefix = task.ext.prefix ?: "${meta.id}"
+    def prefix = task.ext.prefix ?: "${meta.id}"
 
-    template 'split_transcripts.py'
+    """
+    python3 ${moduleDir}/templates/split_transcripts.py \\
+        --transcripts ${transcripts} \\
+        --x-bins ${x_bins} \\
+        --y-bins ${y_bins} \\
+        --prefix ${prefix}
+    """
 
     stub:
     // Exit if running this module with -profile conda / -profile mamba

@@ -6,6 +6,7 @@ This script rescales a segmentation mask image to match the coordinate
 space of Xenium transcript data using microns-per-pixel metadata.
 """
 
+import argparse
 import json
 import os
 from typing import Tuple
@@ -14,13 +15,6 @@ import numpy as np
 import pandas as pd
 import tifffile
 from skimage.transform import resize
-
-# Nextflow-injected variables
-MASK = "${mask}"
-TRANSCRIPTS = "${transcripts}"
-METADATA = "${metadata}"
-PREFIX = "${prefix}"
-MASK_FILENAME = "${mask}"
 
 
 def read_mask(mask_path: str) -> np.ndarray:
@@ -113,13 +107,28 @@ def main(mask_path: str, transcripts_path: str, metadata_path: str, output_path:
     print(f"Saved resized mask -> {output_path}")
 
 
+def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Resize a segmentation TIFF mask to match transcript coordinates."
+    )
+    parser.add_argument("--mask", required=True, help="Path to segmentation mask TIFF")
+    parser.add_argument("--transcripts", required=True, help="Path to transcripts file")
+    parser.add_argument("--metadata", required=True, help="Path to metadata JSON")
+    parser.add_argument("--prefix", required=True, help="Output directory prefix")
+    parser.add_argument("--mask-filename", required=True, help="Original mask filename for output naming")
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    os.makedirs(PREFIX, exist_ok=True)
-    output_mask: str = os.path.join(PREFIX, f"resized_{MASK_FILENAME}.tif")
+    args = parse_args()
+
+    os.makedirs(args.prefix, exist_ok=True)
+    output_mask: str = os.path.join(args.prefix, f"resized_{args.mask_filename}.tif")
 
     main(
-        mask_path=MASK,
-        transcripts_path=TRANSCRIPTS,
-        metadata_path=METADATA,
+        mask_path=args.mask,
+        transcripts_path=args.transcripts,
+        metadata_path=args.metadata,
         output_path=output_mask,
     )

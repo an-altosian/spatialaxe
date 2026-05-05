@@ -21,8 +21,15 @@ process FICTURE_PREPROCESS {
 
     script:
     def args = task.ext.args ?: ''
+    def features_arg = features ? "--features ${features}" : ""
 
-    template 'ficture_preprocess.py'
+    """
+    python3 ${moduleDir}/templates/ficture_preprocess.py \\
+        --transcripts ${transcripts} \\
+        ${features_arg} \\
+        --negative-control-regex '${params.negative_control_regex}' \\
+        ${args}
+    """
 
     stub:
     """

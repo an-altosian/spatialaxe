@@ -1,40 +1,18 @@
 #!/usr/bin/env python3
 """Preprocess Xenium transcripts for FICTURE analysis."""
 
+import argparse
 import gzip
 import logging
 import os
 import re
-import shlex
 import sys
 
 import pandas as pd
 
-# Nextflow-injected variables
-TRANSCRIPTS = "${transcripts}"
-FEATURES = "${features}"
-NEGATIVE_CONTROL_REGEX = "${params.negative_control_regex}"
-ARGS = "${args}"
 
-
-def main():
-    """Run FICTURE preprocessing."""
-    print("[START]")
-
-    # Re-build argv so parse_known_args() can absorb any extra flags from task.ext.args
-    sys.argv = [
-        sys.argv[0],
-        "--transcripts",
-        TRANSCRIPTS,
-        "--negative-control-regex",
-        NEGATIVE_CONTROL_REGEX,
-    ]
-    if FEATURES:
-        sys.argv += ["--features", FEATURES]
-    sys.argv += shlex.split(ARGS)
-
-    import argparse
-
+def parse_args():
+    """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
         description="Preprocess Xenium transcripts for FICTURE"
     )
@@ -47,7 +25,13 @@ def main():
     parser.add_argument(
         "--negative-control-regex", default="", help="Regex for negative control probes"
     )
-    args, _ = parser.parse_known_args()
+    return parser.parse_args()
+
+
+def main():
+    """Run FICTURE preprocessing."""
+    args = parse_args()
+    print("[START]")
 
     negctrl_regex = "BLANK|NegCon"
     if args.negative_control_regex:

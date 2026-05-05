@@ -26,8 +26,18 @@ process SEGGER_PREDICT {
 
     def args = task.ext.args ?: ''
     prefix = task.ext.prefix ?: "${meta.id}"
-
-    template 'run_predict.py'
+    """
+    python3 ${moduleDir}/templates/run_predict.py \\
+        --models-dir ${models_dir} \\
+        --segger-data-dir ${segger_dataset} \\
+        --transcripts-file ${transcripts} \\
+        --benchmarks-dir benchmarks_dir \\
+        --batch-size ${params.batch_size_predict} \\
+        --use-cc ${params.cc_analysis} \\
+        --knn-method ${params.segger_knn_method} \\
+        --num-workers ${task.cpus} \\
+        ${args}
+    """
 
     stub:
     // Exit if running this module with -profile conda / -profile mamba

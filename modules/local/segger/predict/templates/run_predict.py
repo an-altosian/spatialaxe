@@ -12,22 +12,11 @@ Both WORKAROUNDs should be removable once the patches are upstreamed to segger.
 
 import argparse
 import os
-import shlex
 import subprocess
 import sys
 
 
 SEGGER_CLI = "/workspace/segger_dev/src/segger/cli/predict_fast.py"
-
-# Nextflow-injected variables
-MODELS_DIR = "${models_dir}"
-SEGGER_DATASET = "${segger_dataset}"
-TRANSCRIPTS = "${transcripts}"
-BATCH_SIZE = "${params.batch_size_predict}"
-USE_CC = "${params.cc_analysis}"
-KNN_METHOD = "${params.segger_knn_method}"
-NUM_WORKERS = "${task.cpus}"
-ARGS = "${args}"
 
 
 def parse_args():
@@ -124,27 +113,6 @@ def run_segger_cli(args, extra, gpu_ids):
 
 
 def main():
-    # Re-build argv from Nextflow-injected constants + any extra task.ext.args flags
-    sys.argv = [
-        sys.argv[0],
-        "--models-dir",
-        MODELS_DIR,
-        "--segger-data-dir",
-        SEGGER_DATASET,
-        "--transcripts-file",
-        TRANSCRIPTS,
-        "--benchmarks-dir",
-        "benchmarks_dir",
-        "--batch-size",
-        BATCH_SIZE,
-        "--use-cc",
-        USE_CC,
-        "--knn-method",
-        KNN_METHOD,
-        "--num-workers",
-        NUM_WORKERS,
-    ] + shlex.split(ARGS)
-
     args, extra = parse_args()
 
     # Limit cupy GPU memory to 80% so PyTorch has headroom for graph attention ops

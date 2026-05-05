@@ -13,17 +13,12 @@ Outputs:
     {prefix}/scale_info.json - Scale factor and original/new dimensions.
 """
 
+import argparse
 import json
 from pathlib import Path
 
 import tifffile
 from skimage.transform import resize
-
-# Nextflow-injected variables
-IMAGE_PATH = "${image}"
-DIAMETER = float("${diameter}")
-DIAM_MEAN = float("${diam_mean}")
-PREFIX = "${prefix}"
 
 # Cellpose network requires a minimum spatial size of 256 px.
 MIN_DIM = 256
@@ -86,10 +81,23 @@ def downscale_image(
     print(f"Done: downscaled.tif written, shape={img_ds.shape}")
 
 
+def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Pre-downscale a morphology image for Cellpose."
+    )
+    parser.add_argument("--image", required=True, help="Morphology TIFF input")
+    parser.add_argument("--diameter", type=float, required=True, help="Target object diameter")
+    parser.add_argument("--diam-mean", type=float, required=True, help="Cellpose model diam_mean")
+    parser.add_argument("--prefix", required=True, help="Output directory")
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
+    args = parse_args()
     downscale_image(
-        image_path=IMAGE_PATH,
-        diameter=DIAMETER,
-        diam_mean=DIAM_MEAN,
-        prefix=PREFIX,
+        image_path=args.image,
+        diameter=args.diameter,
+        diam_mean=args.diam_mean,
+        prefix=args.prefix,
     )

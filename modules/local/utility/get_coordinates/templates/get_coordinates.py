@@ -6,10 +6,9 @@ Reads a Xenium transcripts.parquet file and prints the coordinate
 bounding box (x_min, x_max, y_min, y_max) to stdout.
 """
 
-import pandas as pd
+import argparse
 
-# Nextflow-injected variables
-TRANSCRIPTS = "${transcripts}"
+import pandas as pd
 
 
 def get_coordinates(parquet_path: str):
@@ -42,6 +41,20 @@ def get_coordinates(parquet_path: str):
     )
 
 
+def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Get transcript coordinate bounds from a Parquet file."
+    )
+    parser.add_argument(
+        "--transcripts",
+        required=True,
+        help="Path to transcripts parquet file",
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    result = get_coordinates(TRANSCRIPTS)
+    args = parse_args()
+    result = get_coordinates(args.transcripts)
     print(",".join(str(v) for v in result))

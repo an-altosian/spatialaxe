@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Write spatialdata object from segmentation format."""
 
+import argparse
 import sys
 
 import pandas as pd
-import spatialdata  # noqa: F401  (preserved from original; ensures spatialdata loads before spatialdata_io)
+import spatialdata
 from spatialdata_io import xenium
 
 # Fix zarr v3 + anndata + numcodecs incompatibility:
@@ -14,14 +15,6 @@ from spatialdata_io import xenium
 # create_array to strip numcodecs codecs and let zarr v3 handle strings natively.
 import numcodecs
 import zarr.core.group as _zarr_group
-
-# Nextflow-injected variables
-BUNDLE = "${bundle}"
-PREFIX = "${prefix}"
-OUTPUT_FOLDER = "${outputfolder}"
-SEGMENTED_OBJECT = "${segmented_object}"
-COORDINATE_SPACE = "${coordinate_space}"
-FORMAT = "${params.format}"
 
 _orig_create_array = _zarr_group.Group.create_array
 
@@ -84,8 +77,21 @@ def convert_arrow_to_numpy(sdata):
         _convert_df_arrow_to_numpy(adata.var)
 
 
+def parse_args():
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(description="Write spatialdata object from segmentation format")
+    parser.add_argument("--bundle", required=True, help="Path to input bundle")
+    parser.add_argument("--prefix", required=True, help="Output prefix (sample ID)")
+    parser.add_argument("--output-folder", required=True, help="Output folder name")
+    parser.add_argument("--segmented-object", required=True, help="Segmented object type (cells, nuclei, cells_and_nuclei)")
+    parser.add_argument("--coordinate-space", required=True, help="Coordinate space (pixels, microns)")
+    parser.add_argument("--format", required=True, help="Input format (xenium)")
+    return parser.parse_args()
+
+
 def main():
     """Run spatialdata write."""
+    args = parse_args()
     print("[START]")
 
     cells_as_circles = False
@@ -94,13 +100,13 @@ def main():
     cells_labels = False
     nucleus_labels = False
 
-    if SEGMENTED_OBJECT == "cells":
+    if args.segmented_object == "cells":
         cells_boundaries = True
         cells_labels = True
-    elif SEGMENTED_OBJECT == "nuclei":
+    elif args.segmented_object == "nuclei":
         nucleus_boundaries = True
         nucleus_labels = True
-    elif SEGMENTED_OBJECT == "cells_and_nuclei":
+    elif args.segmented_object == "cells_and_nuclei":
         cells_boundaries = True
         nucleus_boundaries = True
         cells_labels = True
@@ -109,7 +115,7 @@ def main():
         cells_as_circles = False
 
     # set sd variables based on the coordinate space
-    if COORDINATE_SPACE == "pixels":
+    if args.coordinate_space == "pixels":
         cells_labels = True
         nucleus_labels = True
         # Labels are sufficient in pixel space; boundaries can contain
@@ -118,16 +124,16 @@ def main():
         cells_boundaries = False
         nucleus_boundaries = False
 
-    if COORDINATE_SPACE == "microns":
+    if args.coordinate_space == "microns":
         cells_labels = False
         cells_boundaries = True
         nucleus_boundaries = False
         nucleus_labels = False
         cells_as_circles = False
 
-    if FORMAT == "xenium":
+    if args.format == "xenium":
         sd_xenium_obj = xenium(
-            BUNDLE,
+            args.bundle,
             cells_as_circles=cells_as_circles,
             cells_boundaries=cells_boundaries,
             nucleus_boundaries=nucleus_boundaries,
@@ -139,7 +145,7 @@ def main():
         )
         print(sd_xenium_obj)
         convert_arrow_to_numpy(sd_xenium_obj)
-        sd_xenium_obj.write(f"spatialdata/{PREFIX}/{OUTPUT_FOLDER}")
+        sd_xenium_obj.write(f"spatialdata/{args.prefix}/{args.output_folder}")
     else:
         sys.exit("[ERROR] Format not found")
 

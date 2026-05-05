@@ -9,17 +9,13 @@ by downscale_morphology.py).
 Output: {prefix}/upscaled_{mask_basename}.tif
 """
 
+import argparse
 import json
 from pathlib import Path
 
 import numpy as np
 import tifffile
 from PIL import Image
-
-# Nextflow-injected variables
-MASK = "${mask}"
-SCALE_INFO = "${scale_info}"
-PREFIX = "${prefix}"
 
 
 def upscale_mask(mask_path: str, scale_info_path: str, prefix: str) -> None:
@@ -56,9 +52,21 @@ def upscale_mask(mask_path: str, scale_info_path: str, prefix: str) -> None:
     )
 
 
+def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Upscale a Cellpose mask back to original resolution."
+    )
+    parser.add_argument("--mask", required=True, help="Downscaled mask TIFF")
+    parser.add_argument("--scale-info", required=True, help="scale_info.json from downscale step")
+    parser.add_argument("--prefix", required=True, help="Output directory")
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
+    args = parse_args()
     upscale_mask(
-        mask_path=MASK,
-        scale_info_path=SCALE_INFO,
-        prefix=PREFIX,
+        mask_path=args.mask,
+        scale_info_path=args.scale_info,
+        prefix=args.prefix,
     )

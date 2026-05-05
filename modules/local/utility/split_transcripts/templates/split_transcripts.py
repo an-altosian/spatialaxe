@@ -6,16 +6,11 @@ Reads a Xenium transcripts.parquet file and computes quantile-based spatial
 tiles, writing a splits.csv with tile boundaries.
 """
 
+import argparse
 import os
 from typing import List
 
 import pandas as pd
-
-# Nextflow-injected variables
-TRANSCRIPTS = "${transcripts}"
-X_BINS = "${x_bins}"
-Y_BINS = "${y_bins}"
-PREFIX = "${prefix}"
 
 
 def compute_quantile_ranges(df: pd.DataFrame, col: str, n_bins: int) -> List:
@@ -74,10 +69,41 @@ def main(
     return None
 
 
+def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Split transcript coordinates into spatial tiles."
+    )
+    parser.add_argument(
+        "--transcripts",
+        required=True,
+        help="Path to transcripts parquet file",
+    )
+    parser.add_argument(
+        "--x-bins",
+        type=int,
+        required=True,
+        help="Number of bins along X axis",
+    )
+    parser.add_argument(
+        "--y-bins",
+        type=int,
+        required=True,
+        help="Number of bins along Y axis",
+    )
+    parser.add_argument(
+        "--prefix",
+        required=True,
+        help="Output directory prefix",
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
+    args = parse_args()
     main(
-        transcripts=TRANSCRIPTS,
-        x_bins=int(X_BINS),
-        y_bins=int(Y_BINS),
-        prefix=PREFIX,
+        transcripts=args.transcripts,
+        x_bins=args.x_bins,
+        y_bins=args.y_bins,
+        prefix=args.prefix,
     )

@@ -1,25 +1,15 @@
 #!/usr/bin/env python3
-"""Stitch per-patch segmentation results, then post-process the GeoJSON + CSV.
+"""Stitch per-patch Baysor segmentation results into unified output.
 
-Phase 1 (stitch_transcripts):
-    Stitch per-patch Baysor segmentation results into unified output. Uses
-    sopa's solve_conflicts() for overlap resolution at patch boundaries.
-
-Phase 2 (postprocess):
-    Ensures every GeoJSON feature is a single Polygon: make_valid() and
-    sopa.solve_conflicts() can produce MultiPolygon, MultiLineString, or
-    GeometryCollection geometries that XeniumRanger rejects. Cells dropped
-    during cleanup are also reassigned to UNASSIGNED in the transcript CSV
-    so the two outputs stay consistent.
+Standalone script that replaces the xenium_patch CLI package's stitch
+functionality. Uses sopa's solve_conflicts() for overlap resolution.
 """
 
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 import os
-import shlex
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,11 +23,6 @@ import shapely
 from shapely.affinity import translate
 from shapely.geometry import mapping, shape
 from sopa.segmentation.resolve import solve_conflicts
-
-# Nextflow-injected variables
-PATCHES = "${patches}"
-ARGS = "${args}"  # task.ext.args, may be empty
-
 
 # ---------------------------------------------------------------------------
 # Geometry helpers
@@ -59,7 +44,7 @@ def _ensure_polygon(geom) -> "shapely.Polygon | None":
     if geom.geom_type == "GeometryCollection":
         polys = [g for g in geom.geoms if g.geom_type == "Polygon"]
         return max(polys, key=lambda g: g.area) if polys else None
-    # LineString, MultiLineString, Point, etc. -- not a polygon
+    # LineString, MultiLineString, Point, etc. — not a polygon
     return None
 
 
@@ -645,7 +630,7 @@ def _stitch_sopa_resolve(
 
 
 # ---------------------------------------------------------------------------
-# Main orchestrator (stitch phase)
+# Main orchestrator
 # ---------------------------------------------------------------------------
 
 
@@ -779,17 +764,11 @@ def stitch_transcript_assignments(
 
 
 # ---------------------------------------------------------------------------
-# Phase 1 entry point: stitch_transcripts (replaces stitch_transcripts.py main)
+# CLI
 # ---------------------------------------------------------------------------
 
 
-def stitch_transcripts(patches_dir: str, output_dir: str, args_str: str) -> None:
-    """Phase 1: parse extra CLI args and run the stitch orchestrator.
-
-    Mirrors the original ``stitch_transcripts.py`` argparse interface so that
-    any flags passed through ``task.ext.args`` are honored by the same
-    parser as before.
-    """
+def main() -> None:
     parser = argparse.ArgumentParser(
         description="Stitch per-patch Baysor segmentation results into unified output."
     )
@@ -815,106 +794,13 @@ def stitch_transcripts(patches_dir: str, output_dir: str, args_str: str) -> None
         default="segmentation_polygons.json",
         help="GeoJSON filename within each patch (default: segmentation_polygons.json)",
     )
-
-    argv = ["--patches", patches_dir, "--output", output_dir]
-    if args_str:
-        argv.extend(shlex.split(args_str))
-    parsed = parser.parse_args(argv)
+    args = parser.parse_args()
 
     stitch_transcript_assignments(
-        patches_dir=parsed.patches,
-        output_dir=parsed.output,
-        csv_filename=parsed.csv_filename,
-        geojson_filename=parsed.geojson_filename,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Phase 2: post-processing (from stitch_postprocess.py)
-# ---------------------------------------------------------------------------
-
-
-def clean_geojson(geojson_path: str) -> set:
-    """
-    Force every feature to a single valid Polygon.
-
-    Returns the set of cell ids whose features were dropped.
-    """
-    with open(geojson_path) as f:
-        data = json.load(f)
-
-    clean = []
-    dropped_cells = set()
-    for feat in data["features"]:
-        geom = shape(feat["geometry"])
-        if not geom.is_valid:
-            geom = shapely.make_valid(geom)
-        poly = None
-        if geom.geom_type == "Polygon":
-            poly = geom
-        elif geom.geom_type == "MultiPolygon":
-            poly = max(geom.geoms, key=lambda g: g.area)
-        elif geom.geom_type == "GeometryCollection":
-            polys = [g for g in geom.geoms if g.geom_type == "Polygon"]
-            if polys:
-                poly = max(polys, key=lambda g: g.area)
-        if poly is not None and not poly.is_empty:
-            feat["geometry"] = mapping(poly)
-            clean.append(feat)
-        else:
-            cell_id = feat.get("id") or feat.get("properties", {}).get("cell_id", "")
-            dropped_cells.add(str(cell_id))
-
-    print(f"GeoJSON: {len(clean)} kept, {len(dropped_cells)} dropped: {dropped_cells}")
-    data["features"] = clean
-    with open(geojson_path, "w") as f:
-        json.dump(data, f)
-
-    return dropped_cells
-
-
-def reassign_dropped(csv_path: str, dropped_cells: set) -> None:
-    """
-    Reassign transcripts of dropped cells to UNASSIGNED in the CSV.
-    """
-    if not dropped_cells:
-        return
-
-    with open(csv_path) as f:
-        reader = csv.DictReader(f)
-        fieldnames = reader.fieldnames
-        rows = list(reader)
-
-    reassigned = 0
-    for row in rows:
-        if row["cell"] in dropped_cells:
-            row["cell"] = ""
-            row["is_noise"] = "1"
-            reassigned += 1
-
-    with open(csv_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
-    print(f"CSV: {reassigned} transcripts reassigned to UNASSIGNED")
-
-
-def postprocess(geojson_path: str, csv_path: str) -> None:
-    """Phase 2 entry point: cleanup polygons and reconcile the CSV."""
-    dropped = clean_geojson(geojson_path)
-    reassign_dropped(csv_path, dropped)
-
-
-# ---------------------------------------------------------------------------
-# Main: run both phases sequentially
-# ---------------------------------------------------------------------------
-
-
-def main() -> None:
-    stitch_transcripts(PATCHES, "output", ARGS)
-    postprocess(
-        "output/xr-cell-polygons.geojson",
-        "output/xr-transcript-metadata.csv",
+        patches_dir=args.patches,
+        output_dir=args.output,
+        csv_filename=args.csv_filename,
+        geojson_filename=args.geojson_filename,
     )
 
 

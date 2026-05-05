@@ -6,18 +6,10 @@ Filters transcripts based on quality score and spatial coordinate thresholds,
 removes negative control probes, and outputs filtered CSV for Baysor compatibility.
 """
 
+import argparse
 import os
 
 import pandas as pd
-
-# Nextflow-injected variables
-TRANSCRIPTS = "${transcripts}"
-PREFIX = "${prefix}"
-MIN_QV = "${min_qv}"
-MIN_X = "${min_x}"
-MAX_X = "${max_x}"
-MIN_Y = "${min_y}"
-MAX_Y = "${max_y}"
 
 
 def filter_transcripts(
@@ -78,14 +70,53 @@ def main() -> None:
     """
     Run preprocess transcripts as nf module.
     """
+    parser = argparse.ArgumentParser(
+        description="Preprocess Xenium transcripts for Baysor"
+    )
+    parser.add_argument(
+        "--transcripts", required=True, help="Path to transcripts parquet file"
+    )
+    parser.add_argument("--prefix", required=True, help="Output directory prefix")
+    parser.add_argument(
+        "--min-qv",
+        type=float,
+        default=20.0,
+        help="Minimum Q-Score threshold (default: 20.0)",
+    )
+    parser.add_argument(
+        "--min-x",
+        type=float,
+        default=0.0,
+        help="Minimum x-coordinate threshold (default: 0.0)",
+    )
+    parser.add_argument(
+        "--max-x",
+        type=float,
+        default=24000.0,
+        help="Maximum x-coordinate threshold (default: 24000.0)",
+    )
+    parser.add_argument(
+        "--min-y",
+        type=float,
+        default=0.0,
+        help="Minimum y-coordinate threshold (default: 0.0)",
+    )
+    parser.add_argument(
+        "--max-y",
+        type=float,
+        default=24000.0,
+        help="Maximum y-coordinate threshold (default: 24000.0)",
+    )
+    args = parser.parse_args()
+
     filter_transcripts(
-        transcripts=TRANSCRIPTS,
-        min_qv=float(MIN_QV),
-        min_x=float(MIN_X),
-        max_x=float(MAX_X),
-        min_y=float(MIN_Y),
-        max_y=float(MAX_Y),
-        prefix=PREFIX,
+        transcripts=args.transcripts,
+        min_qv=args.min_qv,
+        min_x=args.min_x,
+        max_x=args.max_x,
+        min_y=args.min_y,
+        max_y=args.max_y,
+        prefix=args.prefix,
     )
 
     return None

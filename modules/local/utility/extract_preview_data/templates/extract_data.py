@@ -6,6 +6,7 @@ Parses embedded Vega-Lite spec variables and base64 PNG images from the
 Baysor preview.html file, writing MultiQC-compatible TSV and PNG files.
 """
 
+import argparse
 import base64
 import html
 import json
@@ -16,10 +17,6 @@ from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 from bs4 import BeautifulSoup
-
-# Nextflow-injected variables
-PREVIEW_HTML = "${preview_html}"
-PREFIX = "${prefix}"
 
 
 def get_png_files(soup: BeautifulSoup, outdir: Path) -> None:
@@ -163,9 +160,29 @@ def write_tsvs(specs: Dict[str, str], outdir: Path) -> List[Path]:
     return written
 
 
+def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Extract preview data from Baysor preview HTML reports."
+    )
+    parser.add_argument(
+        "--preview-html",
+        required=True,
+        help="Path to Baysor preview HTML file",
+    )
+    parser.add_argument(
+        "--prefix",
+        required=True,
+        help="Output directory prefix (sample ID)",
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    input_path: Path = Path(PREVIEW_HTML)
-    outdir: Path = Path(PREFIX)
+    args = parse_args()
+
+    input_path: Path = Path(args.preview_html)
+    outdir: Path = Path(args.prefix)
 
     text = input_path.read_text(encoding="utf-8", errors="ignore")
     soup = BeautifulSoup(text, "html.parser")

@@ -24,9 +24,14 @@ process SEGGER2XR {
         error "SEGGER2XR module does not support Conda. Please use Docker / Singularity / Podman instead."
     }
 
-    min_transcripts = task.ext.min_transcripts_per_cell ?: 3
+    def min_transcripts = task.ext.min_transcripts_per_cell ?: 3
 
-    template 'segger2xr.py'
+    """
+    python3 ${moduleDir}/templates/segger2xr.py \\
+        --transcripts ${transcripts} \\
+        --prefix ${meta.id} \\
+        --min-transcripts ${min_transcripts}
+    """
 
     stub:
     // Exit if running this module with -profile conda / -profile mamba

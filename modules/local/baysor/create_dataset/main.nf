@@ -23,7 +23,12 @@ process BAYSOR_CREATE_DATASET {
 
     prefix = task.ext.prefix ?: "${meta.id}"
 
-    template 'create_dataset.py'
+    """
+    python3 ${moduleDir}/templates/create_dataset.py \\
+        --transcripts ${transcripts} \\
+        --sample-fraction ${sample_fraction} \\
+        --prefix ${prefix}
+    """
 
     stub:
     // Exit if running this module with -profile conda / -profile mamba

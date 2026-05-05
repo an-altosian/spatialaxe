@@ -7,12 +7,10 @@ segmenters (e.g. StarDist) often emit int32 labels. This script reads
 the input mask, casts it to uint32, and writes the result.
 """
 
+import argparse
+
 import numpy as np
 import tifffile
-
-# Nextflow-injected variables
-INPUT_PATH = "${mask}"
-OUTPUT_PATH = "${prefix}_uint32_mask.tif"
 
 
 def convert_mask_to_uint32(input_path: str, output_path: str) -> None:
@@ -29,5 +27,20 @@ def convert_mask_to_uint32(input_path: str, output_path: str) -> None:
     print("Output dtype: uint32")
 
 
+def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Convert a segmentation mask TIFF to uint32 dtype."
+    )
+    parser.add_argument(
+        "--input", required=True, help="Path to input mask TIFF"
+    )
+    parser.add_argument(
+        "--output", required=True, help="Path where uint32 mask will be written"
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    convert_mask_to_uint32(input_path=INPUT_PATH, output_path=OUTPUT_PATH)
+    args = parse_args()
+    convert_mask_to_uint32(input_path=args.input, output_path=args.output)

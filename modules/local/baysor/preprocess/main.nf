@@ -29,7 +29,16 @@ process BAYSOR_PREPROCESS_TRANSCRIPTS {
 
     prefix = task.ext.prefix ?: "${meta.id}"
 
-    template 'preprocess_transcripts.py'
+    """
+    python3 ${moduleDir}/templates/preprocess_transcripts.py \\
+        --transcripts ${transcripts} \\
+        --prefix ${prefix} \\
+        --min-qv ${min_qv} \\
+        --min-x ${min_x} \\
+        --max-x ${max_x} \\
+        --min-y ${min_y} \\
+        --max-y ${max_y}
+    """
 
     stub:
     // Exit if running this module with -profile conda / -profile mamba

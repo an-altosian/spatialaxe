@@ -34,8 +34,18 @@ process XENIUM_PATCH_STITCH {
 
     script:
     def args = task.ext.args ?: ''
+    """
+    python3 ${moduleDir}/templates/stitch_transcripts.py \\
+        --patches ${patches} \\
+        --output output \\
+        ${args}
 
-    template 'stitch.py'
+    # Post-process: ensure all GeoJSON geometries are Polygon and
+    # reconcile dropped cells in the transcript CSV.
+    python3 ${moduleDir}/templates/stitch_postprocess.py \\
+        --geojson output/xr-cell-polygons.geojson \\
+        --csv output/xr-transcript-metadata.csv
+    """
 
     stub:
     """

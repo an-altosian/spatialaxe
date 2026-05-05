@@ -6,15 +6,11 @@ Reads a CSV transcript file and randomly samples a fraction of rows,
 writing the result to a new CSV file.
 """
 
+import argparse
 import csv
 import os
 import random
 from pathlib import Path
-
-# Nextflow-injected variables
-TRANSCRIPTS = "${transcripts}"
-SAMPLE_FRACTION = "${sample_fraction}"
-PREFIX = "${prefix}"
 
 
 class BaysorPreview():
@@ -66,14 +62,31 @@ def main() -> None:
     """
     Run create dataset as nf module
     """
+    parser = argparse.ArgumentParser(
+        description="Create sampled dataset for Baysor preview"
+    )
+    parser.add_argument(
+        "--transcripts", required=True,
+        help="Path to transcripts CSV file"
+    )
+    parser.add_argument(
+        "--sample-fraction", required=True, type=float,
+        help="Fraction of rows to sample"
+    )
+    parser.add_argument(
+        "--prefix", required=True,
+        help="Output directory prefix"
+    )
+    args = parser.parse_args()
+
     sampled_transcripts = "sampled_transcripts.csv"
 
     # generate dataset
     BaysorPreview.generate_dataset(
-        transcripts=TRANSCRIPTS,
+        transcripts=args.transcripts,
         sampled_transcripts=sampled_transcripts,
-        sample_fraction=float(SAMPLE_FRACTION),
-        prefix=PREFIX,
+        sample_fraction=args.sample_fraction,
+        prefix=args.prefix
     )
 
     return None

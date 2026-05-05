@@ -7,17 +7,13 @@ produces Baysor-format segmentation CSV, refined transcripts parquet,
 and GeoJSON cell boundary polygons for xeniumranger import-segmentation.
 """
 
+import argparse
 import json
 from pathlib import Path
 from typing import List
 
 import pandas as pd
 from scipy.spatial import ConvexHull
-
-# Nextflow-injected variables
-TRANSCRIPTS = "${transcripts}"
-PREFIX = "${meta.id}"
-MIN_TRANSCRIPTS = int("${min_transcripts}")
 
 # Expected columns in transcripts.parquet
 REQUIRED_COLUMNS: List[str] = [
@@ -218,9 +214,34 @@ def main(input_file: str, prefix: str, min_transcripts: int = 3) -> None:
     generate_viz_polygons(transcripts, f"{prefix}/segmentation_polygons.json", cell_map)
 
 
+def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Convert Segger prediction output to XeniumRanger-compatible format."
+    )
+    parser.add_argument(
+        "--transcripts",
+        required=True,
+        help="Path to Segger output transcripts parquet file",
+    )
+    parser.add_argument(
+        "--prefix",
+        required=True,
+        help="Output directory prefix (sample ID)",
+    )
+    parser.add_argument(
+        "--min-transcripts",
+        type=int,
+        default=3,
+        help="Minimum transcripts per cell (default: 3)",
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
+    args = parse_args()
     main(
-        input_file=TRANSCRIPTS,
-        prefix=PREFIX,
-        min_transcripts=MIN_TRANSCRIPTS,
+        input_file=args.transcripts,
+        prefix=args.prefix,
+        min_transcripts=args.min_transcripts,
     )

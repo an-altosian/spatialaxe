@@ -11,14 +11,8 @@ Wraps segger's create_dataset_fast.py with:
 Each WORKAROUND should be removable when the upstream segger bug is fixed.
 """
 
-# ruff: noqa: E402  -- NUMBA_CACHE_DIR must be set before subsequent imports
-# (segger / torch transitively pull in numba). Order matters; do not reorder.
+import argparse
 import os
-
-os.environ["NUMBA_CACHE_DIR"] = os.path.join(os.getcwd(), ".numba_cache")
-os.makedirs(os.environ["NUMBA_CACHE_DIR"], exist_ok=True)
-
-import shlex
 import shutil
 import subprocess
 import sys
@@ -32,14 +26,18 @@ import torch
 
 SEGGER_CLI = "/workspace/segger_dev/src/segger/cli/create_dataset_fast.py"
 
-# Nextflow-injected variables
-BUNDLE_DIR = "${base_dir}"
-OUTPUT_DIR = "${prefix}"
-SAMPLE_TYPE = "${params.format}"
-TILE_WIDTH = "${params.tile_width}"
-TILE_HEIGHT = "${params.tile_height}"
-N_WORKERS = "${task.cpus}"
-ARGS = "${args}"
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--bundle-dir", required=True)
+    p.add_argument("--output-dir", required=True)
+    p.add_argument("--sample-type", required=True, choices=["xenium"])
+    p.add_argument("--tile-width", type=int, required=True)
+    p.add_argument("--tile-height", type=int, required=True)
+    p.add_argument("--n-workers", type=int, required=True)
+    # remaining args forwarded to segger CLI
+    args, extra = p.parse_known_args()
+    return args, extra
 
 
 def prepare_bundle(bundle_dir):
@@ -112,22 +110,22 @@ def add_parquet_stats():
     print("=== End Debug ===\n")
 
 
-def run_segger_cli(output_dir, sample_type, tile_width, tile_height, n_workers, extra):
+def run_segger_cli(args, extra):
     cmd = [
         "python3",
         SEGGER_CLI,
         "--base_dir",
         "bundle_stats",
         "--data_dir",
-        output_dir,
+        args.output_dir,
         "--sample_type",
-        sample_type,
+        args.sample_type,
         "--tile_width",
-        str(tile_width),
+        str(args.tile_width),
         "--tile_height",
-        str(tile_height),
+        str(args.tile_height),
         "--n_workers",
-        str(n_workers),
+        str(args.n_workers),
         *extra,
     ]
     print(f"Running: {' '.join(cmd)}")
@@ -230,9 +228,13 @@ def fix_bd_x_nan(prefix):
 
 
 def main():
-    extra = shlex.split(ARGS)
+    args, extra = parse_args()
 
-    prepare_bundle(BUNDLE_DIR)
+    # Ensure numba cache dir is writable (env var should be set by caller, but belt-and-suspenders)
+    os.environ.setdefault("NUMBA_CACHE_DIR", os.path.join(os.getcwd(), ".numba_cache"))
+    os.makedirs(os.environ["NUMBA_CACHE_DIR"], exist_ok=True)
+
+    prepare_bundle(args.bundle_dir)
     print("Adding statistics to parquet files...")
     add_parquet_stats()
 
@@ -241,17 +243,10 @@ def main():
     for item in sorted(Path("bundle_stats").iterdir()):
         print(f"  {item.name}")
 
-    run_segger_cli(
-        OUTPUT_DIR,
-        SAMPLE_TYPE,
-        int(TILE_WIDTH),
-        int(TILE_HEIGHT),
-        int(N_WORKERS),
-        extra,
-    )
+    run_segger_cli(args, extra)
 
-    filter_trainable_tiles_if_needed(OUTPUT_DIR)
-    fix_bd_x_nan(OUTPUT_DIR)
+    filter_trainable_tiles_if_needed(args.output_dir)
+    fix_bd_x_nan(args.output_dir)
 
 
 if __name__ == "__main__":

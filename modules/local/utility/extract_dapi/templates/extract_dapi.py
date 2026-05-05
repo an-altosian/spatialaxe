@@ -8,12 +8,9 @@ expect one channel as input. This script reads the input image, slices
 the requested channel, and writes the result.
 """
 
-import tifffile
+import argparse
 
-# Nextflow-injected variables
-INPUT_PATH = "${image}"
-OUTPUT_PATH = "${prefix}_dapi.tif"
-CHANNEL_INDEX = int("${channel_index}")
+import tifffile
 
 
 def extract_channel(input_path: str, output_path: str, channel_index: int) -> None:
@@ -37,9 +34,27 @@ def extract_channel(input_path: str, output_path: str, channel_index: int) -> No
     print(f"Input shape: {orig_shape} -> extracted channel {channel_index}: {img.shape}")
 
 
+def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Extract a single channel from a multi-channel OME-TIFF."
+    )
+    parser.add_argument(
+        "--input", required=True, help="Path to multi-channel OME-TIFF morphology image"
+    )
+    parser.add_argument(
+        "--output", required=True, help="Path where the single-channel TIFF will be written"
+    )
+    parser.add_argument(
+        "--channel-index", type=int, default=0, help="Channel index to extract (default: 0)"
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
+    args = parse_args()
     extract_channel(
-        input_path=INPUT_PATH,
-        output_path=OUTPUT_PATH,
-        channel_index=CHANNEL_INDEX,
+        input_path=args.input,
+        output_path=args.output,
+        channel_index=args.channel_index,
     )
