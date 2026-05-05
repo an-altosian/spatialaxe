@@ -25,11 +25,7 @@ process EXTRACT_PREVIEW_DATA {
 
     prefix = task.ext.prefix ?: "${meta.id}"
 
-    """
-    extract_data.py \\
-        --preview-html ${preview_html} \\
-        --prefix ${prefix}
-    """
+    template 'extract_data.py'
 
     stub:
     // Exit if running this module with -profile conda / -profile mamba

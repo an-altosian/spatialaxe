@@ -29,19 +29,7 @@ process SEGGER_CREATE_DATASET {
         error("${params.format} is an invalid platform type.")
     }
 
-    """
-    export NUMBA_CACHE_DIR=\$PWD/.numba_cache
-    mkdir -p \$NUMBA_CACHE_DIR
-
-    run_create_dataset.py \\
-        --bundle-dir ${base_dir} \\
-        --output-dir ${prefix} \\
-        --sample-type ${params.format} \\
-        --tile-width ${params.tile_width} \\
-        --tile-height ${params.tile_height} \\
-        --n-workers ${task.cpus} \\
-        ${args}
-    """
+    template 'run_create_dataset.py'
 
     stub:
     // Exit if running this module with -profile conda / -profile mamba

@@ -34,12 +34,8 @@ process UPSCALE_MASK {
 
     script:
     prefix = task.ext.prefix ?: "${meta.id}"
-    """
-    upscale_mask.py \\
-        --mask ${mask} \\
-        --scale-info ${scale_info} \\
-        --prefix ${prefix}
-    """
+
+    template 'upscale_mask.py'
 
     stub:
     prefix = task.ext.prefix ?: "${meta.id}"

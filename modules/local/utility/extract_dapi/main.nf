@@ -35,12 +35,8 @@ process EXTRACT_DAPI {
     script:
     prefix = task.ext.prefix ?: "${meta.id}"
     def channel_index = task.ext.channel_index ?: 0
-    """
-    extract_dapi.py \\
-        --input ${image} \\
-        --output ${prefix}_dapi.tif \\
-        --channel-index ${channel_index}
-    """
+
+    template 'extract_dapi.py'
 
     stub:
     prefix = task.ext.prefix ?: "${meta.id}"

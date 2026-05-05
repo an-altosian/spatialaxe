@@ -25,14 +25,7 @@ process SPATIALDATA_META {
 
     prefix = task.ext.prefix ?: "${meta.id}"
 
-    """
-    spatialdata_meta.py \\
-        --spatialdata-bundle ${spatialdata_bundle} \\
-        --xenium-bundle ${xenium_bundle} \\
-        --prefix ${prefix} \\
-        --metadata '${meta}' \\
-        --output-folder ${outputfolder}
-    """
+    template 'spatialdata_meta.py'
 
     stub:
     // Exit if running this module with -profile conda / -profile mamba

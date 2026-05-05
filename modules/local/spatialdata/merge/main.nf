@@ -25,13 +25,7 @@ process SPATIALDATA_MERGE {
 
     prefix = task.ext.prefix ?: "${meta.id}"
 
-    """
-    spatialdata_merge.py \\
-        --raw-bundle ${raw_bundle} \\
-        --redefined-bundle ${redefined_bundle} \\
-        --prefix ${prefix} \\
-        --output-folder ${outputfolder}
-    """
+    template 'spatialdata_merge.py'
 
     stub:
     // Exit if running this module with -profile conda / -profile mamba

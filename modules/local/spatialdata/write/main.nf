@@ -27,15 +27,7 @@ process SPATIALDATA_WRITE {
 
     prefix = task.ext.prefix ?: "${meta.id}"
 
-    """
-    spatialdata_write.py \\
-        --bundle ${bundle} \\
-        --prefix ${prefix} \\
-        --output-folder ${outputfolder} \\
-        --segmented-object ${segmented_object} \\
-        --coordinate-space ${coordinate_space} \\
-        --format ${params.format}
-    """
+    template 'spatialdata_write.py'
 
     stub:
     // Exit if running this module with -profile conda / -profile mamba

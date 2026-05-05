@@ -34,11 +34,8 @@ process CONVERT_MASK_UINT32 {
 
     script:
     prefix = task.ext.prefix ?: "${meta.id}"
-    """
-    convert_mask_uint32.py \\
-        --input ${mask} \\
-        --output ${prefix}_uint32_mask.tif
-    """
+
+    template 'convert_mask_uint32.py'
 
     stub:
     prefix = task.ext.prefix ?: "${meta.id}"

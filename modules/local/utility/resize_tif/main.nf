@@ -25,14 +25,7 @@ process RESIZE_TIF {
 
     prefix = task.ext.prefix ?: "${meta.id}"
 
-    """
-    resize_tif.py \\
-        --mask ${mask} \\
-        --transcripts ${transcripts} \\
-        --metadata ${metadata} \\
-        --prefix ${prefix} \\
-        --mask-filename ${mask}
-    """
+    template 'resize_tif.py'
 
     stub:
     // Exit if running this module with -profile conda / -profile mamba
