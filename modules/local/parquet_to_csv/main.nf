@@ -32,8 +32,11 @@ process PARQUET_TO_CSV {
     python3 -c "
 import pyarrow.parquet as pq
 import pyarrow.csv as pa_csv
-t = pq.read_table('${parquet}')
-pa_csv.write_csv(t, 'transcripts.csv')
+pf = pq.ParquetFile('${parquet}')
+with open('transcripts.csv', 'wb') as sink:
+    with pa_csv.CSVWriter(sink, pf.schema_arrow) as writer:
+        for batch in pf.iter_batches(batch_size=200000):
+            writer.write_batch(batch)
 "
     """
 
