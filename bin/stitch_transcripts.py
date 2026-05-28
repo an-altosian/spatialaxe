@@ -25,6 +25,30 @@ from shapely.geometry import mapping, shape
 from sopa.segmentation.resolve import solve_conflicts
 
 # ---------------------------------------------------------------------------
+# Geometry helpers
+# ---------------------------------------------------------------------------
+
+
+def _ensure_polygon(geom) -> "shapely.Polygon | None":
+    """Extract a single Polygon from any geometry, or return None.
+
+    XeniumRanger only accepts Polygon. make_valid() and solve_conflicts
+    can produce MultiPolygon, GeometryCollection, MultiLineString, etc.
+    """
+    if geom is None or geom.is_empty:
+        return None
+    if geom.geom_type == "Polygon":
+        return geom
+    if geom.geom_type == "MultiPolygon":
+        return max(geom.geoms, key=lambda g: g.area)
+    if geom.geom_type == "GeometryCollection":
+        polys = [g for g in geom.geoms if g.geom_type == "Polygon"]
+        return max(polys, key=lambda g: g.area) if polys else None
+    # LineString, MultiLineString, Point, etc. — not a polygon
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Inline types (from _types.py)
 # ---------------------------------------------------------------------------
 
@@ -440,17 +464,10 @@ def _stitch_sopa_resolve(
                 continue
             if not polygon.is_valid:
                 polygon = shapely.make_valid(polygon)
-                if polygon.is_empty:
-                    continue
-            # make_valid can produce MultiPolygon/GeometryCollection;
-            # xeniumranger only accepts Polygon, so keep largest component
-            if polygon.geom_type == "MultiPolygon":
-                polygon = max(polygon.geoms, key=lambda g: g.area)
-            elif polygon.geom_type == "GeometryCollection":
-                polys = [g for g in polygon.geoms if g.geom_type == "Polygon"]
-                if not polys:
-                    continue
-                polygon = max(polys, key=lambda g: g.area)
+            # Ensure we have a single Polygon (xeniumranger rejects all else)
+            polygon = _ensure_polygon(polygon)
+            if polygon is None:
+                continue
 
             all_polygons.append(polygon)
             patch_indices_list.append(i)
@@ -489,14 +506,10 @@ def _stitch_sopa_resolve(
         global_id = f"cell-{rank}"
         geom = resolved_gdf.geometry.iloc[rank - 1]
 
-        # solve_conflicts union can produce MultiPolygon; keep largest
-        if geom.geom_type == "MultiPolygon":
-            geom = max(geom.geoms, key=lambda g: g.area)
-        elif geom.geom_type == "GeometryCollection":
-            polys = [g for g in geom.geoms if g.geom_type == "Polygon"]
-            if not polys:
-                continue
-            geom = max(polys, key=lambda g: g.area)
+        # Ensure single Polygon after solve_conflicts union
+        geom = _ensure_polygon(geom)
+        if geom is None:
+            continue
 
         if orig_idx < 0:
             merged_cell_ids.add(global_id)
@@ -627,7 +640,6 @@ def stitch_transcript_assignments(
     csv_filename: str = "segmentation.csv",
     geojson_filename: str = "segmentation_polygons.json",
     max_workers: int | None = None,
-    min_transcripts_per_cell: int = 0,
 ) -> None:
     """Stitch per-patch transcript assignments and polygons into unified output.
 
@@ -704,51 +716,6 @@ def stitch_transcript_assignments(
             _, first_indices = np.unique(tid_np, return_index=True)
             first_indices.sort()
             merged = merged.take(first_indices)
-
-        # Post-stitch cell filter: drop cells below min_transcripts_per_cell
-        if min_transcripts_per_cell > 0 and "cell" in merged.column_names:
-            cell_col = merged.column("cell")
-            cell_counts: dict[str, int] = {}
-            for c in cell_col.to_pylist():
-                if c:
-                    cell_counts[c] = cell_counts.get(c, 0) + 1
-            small_cells = {
-                cid
-                for cid, cnt in cell_counts.items()
-                if cnt < min_transcripts_per_cell
-            }
-            if small_cells:
-                # Reassign transcripts from small cells to noise
-                new_cell = ["" if c in small_cells else c for c in cell_col.to_pylist()]
-                new_noise = [
-                    "true" if c in small_cells else n
-                    for c, n in zip(
-                        cell_col.to_pylist(),
-                        merged.column("is_noise").to_pylist()
-                        if "is_noise" in merged.column_names
-                        else ["false"] * merged.num_rows,
-                    )
-                ]
-                cidx = merged.column_names.index("cell")
-                merged = merged.set_column(
-                    cidx, "cell", pa.array(new_cell, type=pa.string())
-                )
-                if "is_noise" in merged.column_names:
-                    nidx = merged.column_names.index("is_noise")
-                    merged = merged.set_column(
-                        nidx, "is_noise", pa.array(new_noise, type=pa.string())
-                    )
-                # Remove filtered cells from GeoJSON
-                all_geojson_features[:] = [
-                    f
-                    for f in all_geojson_features
-                    if str(f.get("id", f.get("properties", {}).get("cell_id", "")))
-                    not in small_cells
-                ]
-                print(
-                    f"[stitch] Filtered {len(small_cells)} cells with "
-                    f"<{min_transcripts_per_cell} transcripts"
-                )
 
         # Log assignment stats
         if "cell" in merged.column_names:
@@ -827,12 +794,6 @@ def main() -> None:
         default="segmentation_polygons.json",
         help="GeoJSON filename within each patch (default: segmentation_polygons.json)",
     )
-    parser.add_argument(
-        "--min-transcripts-per-cell",
-        type=int,
-        default=0,
-        help="Drop cells with fewer transcripts (0 = no filter, default: 0)",
-    )
     args = parser.parse_args()
 
     stitch_transcript_assignments(
@@ -840,7 +801,6 @@ def main() -> None:
         output_dir=args.output,
         csv_filename=args.csv_filename,
         geojson_filename=args.geojson_filename,
-        min_transcripts_per_cell=args.min_transcripts_per_cell,
     )
 
 
