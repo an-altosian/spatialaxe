@@ -24,7 +24,7 @@ process FICTURE_PREPROCESS {
     def features_arg = features ? "--features ${features}" : ""
 
     """
-    python3 ${moduleDir}/templates/ficture_preprocess.py \\
+    ficture_preprocess.py \\
         --transcripts ${transcripts} \\
         ${features_arg} \\
         --negative-control-regex '${params.negative_control_regex}' \\

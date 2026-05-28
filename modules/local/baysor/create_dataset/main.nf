@@ -24,7 +24,7 @@ process BAYSOR_CREATE_DATASET {
     prefix = task.ext.prefix ?: "${meta.id}"
 
     """
-    python3 ${moduleDir}/templates/create_dataset.py \\
+    create_dataset.py \\
         --transcripts ${transcripts} \\
         --sample-fraction ${sample_fraction} \\
         --prefix ${prefix}

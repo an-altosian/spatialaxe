@@ -26,7 +26,7 @@ process SPATIALDATA_META {
     prefix = task.ext.prefix ?: "${meta.id}"
 
     """
-    python3 ${moduleDir}/templates/spatialdata_meta.py \\
+    spatialdata_meta.py \\
         --spatialdata-bundle ${spatialdata_bundle} \\
         --xenium-bundle ${xenium_bundle} \\
         --prefix ${prefix} \\

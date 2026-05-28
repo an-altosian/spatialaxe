@@ -30,7 +30,7 @@ process BAYSOR_PREPROCESS_TRANSCRIPTS {
     prefix = task.ext.prefix ?: "${meta.id}"
 
     """
-    python3 ${moduleDir}/templates/preprocess_transcripts.py \\
+    preprocess_transcripts.py \\
         --transcripts ${transcripts} \\
         --prefix ${prefix} \\
         --min-qv ${min_qv} \\

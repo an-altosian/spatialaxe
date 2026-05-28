@@ -26,7 +26,7 @@ process EXTRACT_PREVIEW_DATA {
     prefix = task.ext.prefix ?: "${meta.id}"
 
     """
-    python3 ${moduleDir}/templates/extract_data.py \\
+    extract_data.py \\
         --preview-html ${preview_html} \\
         --prefix ${prefix}
     """

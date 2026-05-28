@@ -26,7 +26,7 @@ process SPATIALDATA_MERGE {
     prefix = task.ext.prefix ?: "${meta.id}"
 
     """
-    python3 ${moduleDir}/templates/spatialdata_merge.py \\
+    spatialdata_merge.py \\
         --raw-bundle ${raw_bundle} \\
         --redefined-bundle ${redefined_bundle} \\
         --prefix ${prefix} \\

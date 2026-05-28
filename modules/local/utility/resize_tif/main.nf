@@ -26,7 +26,7 @@ process RESIZE_TIF {
     prefix = task.ext.prefix ?: "${meta.id}"
 
     """
-    python3 ${moduleDir}/templates/resize_tif.py \\
+    resize_tif.py \\
         --mask ${mask} \\
         --transcripts ${transcripts} \\
         --metadata ${metadata} \\

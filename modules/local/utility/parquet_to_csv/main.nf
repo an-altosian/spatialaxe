@@ -25,7 +25,7 @@ process PARQUET_TO_CSV {
     prefix = task.ext.prefix ?: "${meta.id}"
 
     """
-    python3 ${moduleDir}/templates/parquet_to_csv.py \\
+    parquet_to_csv.py \\
         --transcripts ${transcripts} \\
         --extension ${extension} \\
         --prefix ${prefix}

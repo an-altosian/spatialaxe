@@ -25,7 +25,7 @@ process GET_TRANSCRIPTS_COORDINATES {
     prefix = task.ext.prefix ?: "${meta.id}"
 
     """
-    python3 ${moduleDir}/templates/get_coordinates.py \\
+    get_coordinates.py \\
         --transcripts ${transcripts}
     """
 

@@ -26,7 +26,7 @@ process SPLIT_TRANSCRIPTS {
     def prefix = task.ext.prefix ?: "${meta.id}"
 
     """
-    python3 ${moduleDir}/templates/split_transcripts.py \\
+    split_transcripts.py \\
         --transcripts ${transcripts} \\
         --x-bins ${x_bins} \\
         --y-bins ${y_bins} \\

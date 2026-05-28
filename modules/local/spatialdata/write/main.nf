@@ -28,7 +28,7 @@ process SPATIALDATA_WRITE {
     prefix = task.ext.prefix ?: "${meta.id}"
 
     """
-    python3 ${moduleDir}/templates/spatialdata_write.py \\
+    spatialdata_write.py \\
         --bundle ${bundle} \\
         --prefix ${prefix} \\
         --output-folder ${outputfolder} \\

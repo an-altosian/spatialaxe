@@ -27,7 +27,7 @@ process SEGGER_PREDICT {
     def args = task.ext.args ?: ''
     prefix = task.ext.prefix ?: "${meta.id}"
     """
-    python3 ${moduleDir}/templates/run_predict.py \\
+    run_predict.py \\
         --models-dir ${models_dir} \\
         --segger-data-dir ${segger_dataset} \\
         --transcripts-file ${transcripts} \\
