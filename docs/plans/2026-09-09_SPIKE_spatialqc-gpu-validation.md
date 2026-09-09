@@ -114,7 +114,7 @@ Unaffected by construction.
 
 ### 2.7 The blurry-tile fraction is a variance risk, not a bias
 
-This is the part that still needs real samples, and the reason is not what the plan assumed.
+This was the part that needed real samples, and the reason is not what the plan assumed. Section 4 settles it on real data; the mechanism below is why the answer was not obvious in advance.
 
 The 2D GMM (`fit_focus_gmm_2d`) fits `[log1p(focus_score), log1p(lap_var)]` with `covariance_type="full"` and **no feature scaling**.
 A *uniform* rescaling of `lap_var` would become a pure translation in log space, and a full-covariance GMM is translation-equivariant, so it would be harmless.
@@ -182,29 +182,75 @@ qc.resolve_available_gpus("auto", 0)    -> [0, 1]
 `available_gpu_ids` was the outlier and is now aligned.
 `test_backend.py` had enshrined the inverted convention, so it was corrected in the same commit: left as it was, swapping one function for the other during the protocol migration would have made every default run silently CPU-only, which looks like correct output at roughly 50x the cost.
 
-## 4. What still needs real samples
+## 4. Closed on real samples: no recalibration needed
 
-Everything above uses synthetic mosaics: nuclei-like Gaussian blobs, `lap_var` sampled at tile centres as production does (`image/qc.py:5170`), `focus_score` computed per tile as `std**2/mean`.
-Synthetic data establishes direction and mechanism; it cannot establish where a real sample sits relative to an empirically calibrated cutoff.
+The bundles used by real Tower runs are listed in `tower_launch/*.csv`.
+Two were pulled and their DAPI morphology channels compared, fused versus shim, through the real `fit_focus_gmm_2d` + `classify_roi_blur_2d`:
 
-To close plan section 1, run image QC on 2-3 calibration samples and compare, fused vs shim:
+| Sample          | Platform    | Tiles | Blurry (fused) | Blurry (shim) | Delta        | Relabelled | Verdict     |
+| --------------- | ----------- | ----- | -------------- | ------------- | ------------ | ---------- | ----------- |
+| `v1_R2_control` | Xenium v1   | 1536  | 0.1439         | 0.1582        | **-1.43 pp** | 24 / 1536  | PASS → PASS |
+| `atera_breast`  | Xenium v2   | 1536  | 0.2617         | 0.2591        | **+0.26 pp** | 4 / 1536   | PASS → PASS |
 
-- `pct_blurred_gmm_2d_roi` (the blurry-tile fraction) against `focus_warn: 0.40` / `focus_fail: 0.60`
-- `pct_blurred_gmm_2d_roi_warn: 20.0` (thresholds YAML line 338), which is also downstream of the GMM fraction
-- `lap_focus_corr` against its two cutoffs, as a cheap confirmation of section 2.5 on real data
+**Neither sample changes verdict, and both sit far below `focus_warn: 0.40`.**
 
-A sample that changes verdict is the signal to recalibrate; a sample that does not is evidence the change is safe to ship as-is.
+Two things make this more than a pair of data points.
 
-The scripts used here are reproducible and take about a minute each on one L4:
+First, the deltas are an order of magnitude smaller than the synthetic worst case (-14.58 pp at seed 0). Real tissue does not reproduce the marginal-bimodality pathology that a contrived mosaic can: 24 and 4 tiles out of 1536 move, against 21 out of 144 synthetically.
+
+Second, the harness independently reproduces a number the threshold YAML already records. `atera_breast` measures 25.9-26.2% blurry, and the YAML's own comment says *"Observed tissue-filtered % blurry floor: ~27% even on best samples"*. Landing on the documented production floor from an independent implementation is a real cross-check on the method, not just on the result.
+
+The per-tile shift also agrees with the synthetic nuclei-like estimate — real `fused/shim` median 1.085-1.105 and log-shift sd 0.061-0.066, against 1.067-1.071 and sd 0.053-0.063 synthetically. Section 2.3's choice of the nuclei-like row as the operative figure was right.
+
+**Recommendation: ship the fused operator without recalibrating the cutoffs.**
+
+What this does *not* establish: both samples pass with a wide margin, so neither exercises a sample sitting near 0.40, which is where a 1-2 pp shift would decide a verdict. Six 2048 px windows per sample is a spatial sample of the section, not the whole section. If a borderline sample is known, it is the one worth running — `tests/manual/real_calibration.py` takes a bundle's DAPI channel and prints the table above.
+
+## 5. Reproducing the real-sample comparison
+
+Paths come from the samplesheets of real Tower runs in `tower_launch/`:
+
+```bash
+# Xenium v1, real tissue (397 MiB DAPI channel)
+aws s3 cp s3://altos-lab-genomics-data-spatialout/CI_TXG_XETG00378/\
+20250612__132247__SPTL_009/output-XETG00378__0061499__R2_62985__20250612__132602/\
+morphology_focus/morphology_focus_0000.ome.tif  v1_R2_control_dapi.ome.tif
+
+# Xenium v2 / Atera preview (1.2 GiB DAPI channel, explicitly named)
+aws s3 cp s3://altos-lab-bioinf/data/xenium_v2_preview_data/spatialraw/\
+WTA_Preview_FFPE_Breast_Cancer/WTA_Preview_FFPE_Breast_Cancer/outs/\
+morphology_focus/ch0000_dapi.ome.tif  atera_breast_dapi.ome.tif
+
+CUDA_VISIBLE_DEVICES=0 python tests/manual/real_calibration.py
+```
+
+Two traps worth knowing before repeating this.
+
+The v1 bundle names its channels positionally (`morphology_focus_0000.ome.tif`) while the v2/Atera bundle names them explicitly (`ch0000_dapi.ome.tif`); DAPI is channel 0 in both, but only one of them says so.
+
+And a single downloaded channel file still carries the *multi-file* OME metadata for all four channels, so `tifffile` opens the OME series, fails to find the three siblings, and zero-fills them — at 4x the memory. Read `TiffFile.pages[0]` directly instead. `aszarr` is not an option either: `tifffile` 2025.9.20 requires zarr>=3 for that bridge, and `spatialqc` pins `zarr>=2.18,<3` deliberately.
+
+## 6. What is still open
+
+Section 1 of the plan is answered: two real samples, neither changing verdict, so the cutoffs stand.
+What remains is narrower than "run real samples".
+
+- **A borderline sample.** Both samples measured here pass with a wide margin (0.14 and 0.26 against `focus_warn: 0.40`). A sample already sitting near 0.40 is the only place a 1-2 pp shift decides anything, and none was available. If one is known, run it.
+- **`pct_blurred_gmm_2d_roi_warn: 20.0`** (thresholds YAML line 338) is downstream of the same GMM fraction. `atera_breast` measures 26% blurry, which is already above that 20% warn line under *both* operators, so the fix does not change its verdict either — but that threshold is worth a look on its own merits, independently of this change.
+- **`lap_focus_corr` on real data.** Section 2.5 measured deltas within +0.01 synthetically. Cheap to confirm on a real sample, and not expected to move.
+
+The scripts are reproducible, and the first two take about a minute each on one L4:
 
 ```bash
 # CPU-vs-GPU agreement, and fused-vs-shim divergence across lap_sigma
-python log_gpu_check.py
+python tests/manual/log_gpu_check.py
 # 3-seed GMM stability, blur-correlation sign, lap_focus_corr deltas
-python gmm_invariance2.py
+python tests/manual/gmm_invariance2.py
+# real bundles: per-sample blurry fraction, fused vs shim, against the cutoffs
+python tests/manual/real_calibration.py
 ```
 
-## 5. Environment note for anyone reproducing this
+## 7. Environment note for anyone reproducing this
 
 `xenium-test-local` is missing `esda`, `libpysal` and `nsitk`.
 The unit tests stub all three, so the suite passes without them, but a full end-to-end image QC run needs `nsitk` (`generate_tissue_mask` uses it on the path every run takes) and `esda`/`libpysal` (Moran's I for the negative-probe SNR metric).

@@ -4,7 +4,23 @@ Status: the package exists and is wired into the pipeline inside this repository
 It is not yet published, and the QC containers do not yet contain it.
 This document covers the remaining steps and the decisions that need a human.
 
-## 1. Decision required: the GPU focus-score change
+## 1. RESOLVED: the GPU focus-score change needs no recalibration
+
+> **Closed 2026-09-09 on real samples.**
+> Two bundles from real Tower runs (`tower_launch/*.csv`), 1536 tiles each, compared fused versus shim through the real `fit_focus_gmm_2d` + `classify_roi_blur_2d`:
+>
+> | Sample          | Platform  | Blurry (fused) | Blurry (shim) | Delta        | Verdict     |
+> | --------------- | --------- | -------------- | ------------- | ------------ | ----------- |
+> | `v1_R2_control` | Xenium v1 | 0.1439         | 0.1582        | **-1.43 pp** | PASS → PASS |
+> | `atera_breast`  | Xenium v2 | 0.2617         | 0.2591        | **+0.26 pp** | PASS → PASS |
+>
+> **Neither changes verdict, and both sit far below `focus_warn: 0.40`. Ship the fused operator as-is; do not recalibrate.**
+>
+> The harness reproduces a number the threshold YAML already records — `atera_breast` at 25.9-26.2% blurry against the YAML's *"observed tissue-filtered % blurry floor: ~27% even on best samples"* — which is a cross-check on the method, not only the result.
+>
+> The remaining gap is narrow: both samples pass with a wide margin, so neither exercises a sample sitting near 0.40, which is the only place a 1-2 pp shift decides anything. `tests/manual/real_calibration.py` runs the comparison if a borderline sample turns up.
+>
+> Full numbers and the two bundle-reading traps: [`2026-09-09_SPIKE_spatialqc-gpu-validation.md`](2026-09-09_SPIKE_spatialqc-gpu-validation.md) sections 4 and 5.
 
 > **Update 2026-09-09, after GPU validation.**
 > This section was written without GPU access — the machine's `/dev/nvidia*` nodes appeared two minutes after that session ended, so no CuPy branch had ever executed.
@@ -52,7 +68,7 @@ What this means for existing thresholds:
 - Per-tile blur classification is **relative** to the sample: the primary path is a Gaussian-mixture posterior (`blur_prob_threshold: 0.5`) and the fallback is a percentile of that sample's own scores (`roi_focus_score_percentile: 5.0`). With correlation 0.9937 the within-sample re-ranking is small.
 - The **sample-level** verdicts are absolute: the blurry-tile percentage cutoffs in the `focus` section of the threshold YAML were calibrated empirically on real samples. Those percentages will move, and the module runs under `label 'process_gpu_qc'`, so the historical calibration was most likely done against shim numbers.
 
-Recommended: re-run image QC on two or three calibration samples and compare the reported blurry-tile percentages against the YAML cutoffs before release.
+Recommended: re-run image QC on two or three calibration samples and compare the reported blurry-tile percentages against the YAML cutoffs before release. **Done — see the RESOLVED block at the top of this section; no recalibration is needed.**
 
 ## 2. Container rebuild (blocking for docker-profile tests)
 
