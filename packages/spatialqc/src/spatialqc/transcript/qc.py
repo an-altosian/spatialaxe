@@ -6,242 +6,37 @@ Performs all analysis from notebooks/1_qc_molecule.ipynb and generates figures a
 Authors: Malwina Prater, mprater@altoslabs.com; Dongze He, dhe@altoslabs.com; Felix Krueger, fkrueger@altoslabs.com
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import os
 import sys
+from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
-
-import transcript_stream
 import scanpy as sc
 import seaborn as sns
 
-# ===========================================================================
-# Vendored VERBATIM from upstream ``xenium_helpers.utils``
-# (bin/xenium_helpers/src/xenium_helpers/utils.py) at nf-xenium-processing dev
-# HEAD 5e35cae. This pipeline does not ship the xenium_helpers package, so the
-# helpers this script needs are inlined here with their bodies unchanged.
-# Re-sync: re-copy these definitions from that file; do NOT rename symbols
-# inside this block (including the "mols"/"molecule" names) so it stays a
-# mechanical copy.
-# ===========================================================================
-
-
-def calculate_noise_bound(
-    n_molecules_non_gene_prefix: pd.Series, quant: float = 0.99
-) -> tuple[float, float]:
-    """Calculate the noise bounds based on the non-gene molecules."""
-    from scipy.stats import median_abs_deviation, norm
-
-    if n_molecules_non_gene_prefix.empty:
-        return 0, 0
-
-    quant_val = norm.ppf(quant)
-    n_mols_log = np.log10(n_molecules_non_gene_prefix.values)
-    std = median_abs_deviation(n_mols_log, scale="normal")
-    noise_lb = np.mean(n_mols_log) - quant_val * std
-    noise_ub = np.mean(n_mols_log) + quant_val * std
-    return 10**noise_lb, 10**noise_ub
-
-
-def estimate_min_mols_per_cell(n_mols_per_cell: List[int], min_value: int = 10):
-    n_mols_per_cell = np.log10(np.asarray(n_mols_per_cell) + 1)
-    nm_hist = np.histogram(n_mols_per_cell, bins=100)
-    mode = nm_hist[1][nm_hist[0].argmax()]
-    ci = np.quantile(n_mols_per_cell[n_mols_per_cell > mode], 0.99) - mode
-    return max(min_value, int(round(10 ** (mode - ci))))
-
-
-def format_yaml_like(data: dict, indent: int = 0) -> str:
-    # Borrowed from nf-core
-    """Formats a dictionary to a YAML-like string.
-    Args:
-        data (dict): The dictionary to format.
-        indent (int): The current indentation level.
-    Returns:
-        str: A string formatted as YAML.
-    """
-    yaml_str = ""
-    for key, value in data.items():
-        spaces = "  " * indent
-        if isinstance(value, dict):
-            yaml_str += f"{spaces}{key}:\n{format_yaml_like(value, indent + 1)}"
-        else:
-            yaml_str += f"{spaces}{key}: {value}\n"
-    return yaml_str
-
-
-def dump_versions(
-    file_path: str,
-    packages: List[str],
-    task_name: Optional[str] = None,
-    show: bool = True,
-    include_python: bool = True,
-):
-    # Inspired by nf-core
-    from importlib.metadata import version
-    import platform
-
-    versions: Dict[str, str] = {k: version(k) for k in packages}
-
-    if include_python:
-        versions["python"] = platform.python_version()
-
-    nested: Dict[str, Any] = (
-        {task_name: versions} if task_name is not None else versions
-    )
-    versions_yaml: str = format_yaml_like(nested)
-
-    if show:
-        print(versions_yaml)
-
-    with open(file_path, "w") as f:
-        f.write(versions_yaml)
-
-
-# ---------------------------------------------------------------------------
-# Segmentation-software provenance for QC reports.
-# ---------------------------------------------------------------------------
-
-# Display names for pipeline resegmentation tools (raw params.segmentation
-# value -> human-readable). Used as the name-only fallback when no parsed tool
-# version is available.
-SEGMENTATION_PRETTY = {
-    "cellpose": "Cellpose",
-    "cellpose_baysor": "Cellpose + Baysor",
-    "proseg": "Proseg",
-    "segger": "Segger",
-}
-
-# Per-method component tools as (display name, versions.yml key) pairs. The key
-# is the tool name as it appears inside the segmentation modules' versions.yml
-# (e.g. ``cellpose: 3.0.6``). Order defines how multi-tool labels read.
-SEGMENTATION_TOOL_KEYS = {
-    "cellpose": [("Cellpose", "cellpose")],
-    "cellpose_baysor": [("Cellpose", "cellpose"), ("Baysor", "baysor")],
-    "proseg": [("Proseg", "proseg")],
-    "segger": [("Segger", "segger")],
-}
-
-
-def parse_tool_versions(version_files) -> Dict[str, str]:
-    """Union a list of nf-core ``versions.yml`` files into a flat
-    ``{tool: version}`` map. Each file maps ``process -> {tool: version}``; we
-    flatten across processes (later entries win). Safe-fails per file. Versions
-    are run-global (one tool version per pipeline run), so collecting across all
-    samples/processes and flattening is correct."""
-    import yaml  # local import — pyyaml is a runtime dep, not needed at import
-
-    out: Dict[str, str] = {}
-    for path in version_files or []:
-        try:
-            with open(path, encoding="utf-8") as f:
-                data = yaml.safe_load(f) or {}
-        except (OSError, yaml.YAMLError):
-            continue
-        if not isinstance(data, dict):
-            continue
-        for tools in data.values():
-            if isinstance(tools, dict):
-                for tool, version in tools.items():
-                    if version is not None:
-                        out[str(tool)] = str(version).strip()
-    return out
-
-
-def _tool_label(display: str, key: str, tool_versions: Optional[Dict[str, str]]) -> str:
-    """``"Cellpose"`` + version -> ``"Cellpose v3.0.6"`` (name only if absent)."""
-    version = (tool_versions or {}).get(key)
-    return f"{display} v{version}" if version else display
-
-
-def read_xenium_analysis_sw_version(bundle_dir) -> Optional[str]:
-    """Read ``analysis_sw_version`` from ``experiment.xenium`` (e.g.
-    ``"xenium-4.0.1.0"``). Returns ``None`` on missing file, missing key, or
-    malformed JSON. Mirrors ``read_xenium_pixel_size_um`` in bin/snr_metrics.py.
-    """
-    exp = Path(bundle_dir) / "experiment.xenium"
-    if not exp.is_file():
-        return None
-    try:
-        with open(exp, encoding="utf-8") as f:
-            meta = json.load(f)
-        version = meta.get("analysis_sw_version")
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
-        return None
-    if not version or not isinstance(version, str):
-        return None
-    return version
-
-
-def _parse_xenium_version(analysis_sw_version: Optional[str]) -> Optional[str]:
-    """``"xenium-4.0.1.0"`` -> ``"4.0.1"`` (major.minor.patch). Returns ``None``
-    if no leading numeric components can be parsed."""
-    if not analysis_sw_version:
-        return None
-    tail = analysis_sw_version.split("-", 1)[-1]  # drop a 'xenium-' style prefix
-    nums = []
-    for part in tail.split("."):
-        if part.isdigit():
-            nums.append(part)
-        else:
-            break
-    if not nums:
-        return None
-    return ".".join(nums[:3])
-
-
-def resolve_segmentation_software(
-    bundle_dir,
-    pipeline_segmentation: str = "skip",
-    is_resegmented: bool = False,
-    tool_versions: Optional[Dict[str, str]] = None,
-) -> str:
-    """Human-readable label for the segmentation software that produced the
-    bundle a QC report describes.
-
-    - Un-resegmented / pre-seg / ``skip``: the onboard analysis version from the
-      bundle's ``experiment.xenium`` -> ``"Xenium Onboard Analysis v4.0.1"``.
-    - Pipeline ``xr`` resegmentation: the reseg bundle's own
-      ``analysis_sw_version`` -> ``"Xenium Ranger v4.0.1 (resegmentation)"``.
-    - Other pipeline tools (cellpose / cellpose_baysor / proseg / segger): the
-      tool name plus its version from ``tool_versions`` (parsed from the
-      segmentation ``versions.yml``), e.g. ``"Cellpose v3.0.6"`` or
-      ``"Cellpose v3.0.6 + Baysor v0.6.2"``. Falls back to name-only when the
-      version is unavailable. Their reseg bundle is packaged via ``xeniumranger
-      import-segmentation``, so its ``experiment.xenium`` would mislabel them as
-      Xenium Ranger; the pipeline tool name is authoritative here.
-    """
-    seg = (pipeline_segmentation or "skip").strip()
-    parsed = _parse_xenium_version(read_xenium_analysis_sw_version(bundle_dir))
-
-    if not is_resegmented or seg == "skip":
-        if parsed:
-            return f"Xenium Onboard Analysis v{parsed}"
-        return "Xenium Onboard Analysis (version unknown)"
-
-    if seg == "xr":
-        if parsed:
-            return f"Xenium Ranger v{parsed} (resegmentation)"
-        return "Xenium Ranger (resegmentation)"
-
-    components = SEGMENTATION_TOOL_KEYS.get(seg)
-    if components:
-        return " + ".join(
-            _tool_label(display, key, tool_versions) for display, key in components
-        )
-    return SEGMENTATION_PRETTY.get(seg, seg)
-
-
-# ===========================================================================
-# End vendored xenium_helpers.utils block.
-# ===========================================================================
+# Helpers shared with the image QC analysis now live in spatialqc.bundle /
+# spatialqc.versions / spatialqc.stats, which are the single copies. This block
+# previously inlined them under a "re-sync by re-copying, do NOT rename symbols"
+# banner; the segmentation helpers were verified byte-identical to the copy in
+# the image script, and the four statistics/version helpers byte-identical to
+# upstream xenium_helpers.utils, before being replaced with these imports.
+from spatialqc.bundle import (
+    parse_tool_versions,
+    read_xenium_analysis_sw_version,
+    resolve_segmentation_software,
+)
+from spatialqc.stats import calculate_noise_bound, estimate_min_mols_per_cell
+from spatialqc.transcript import stream as transcript_stream
+from spatialqc.versions import dump_versions
 
 # Set plotting style
 sns.set_theme(style="whitegrid")
@@ -348,9 +143,7 @@ def read_bundle_metrics(bundle_dir, is_resegmented):
         row = pd.read_csv(csv_path, nrows=1).iloc[0].to_dict()
     except (OSError, ValueError, pd.errors.ParserError, IndexError):
         return out
-    out["nuclear_transcripts_per_100um2"] = _csv_float(
-        row.get("nuclear_transcripts_per_100um2")
-    )
+    out["nuclear_transcripts_per_100um2"] = _csv_float(row.get("nuclear_transcripts_per_100um2"))
     out["fraction_empty_cells"] = _csv_float(row.get("fraction_empty_cells"))
     out["segmented_cell_stain_frac"] = _csv_float(row.get("segmented_cell_stain_frac"))
     out["stain_definition"] = _csv_str(row.get("stain_definition"))
@@ -471,9 +264,7 @@ def _frame_gb(df):
         return ""
 
 
-def read_random_parquet_row_groups(
-    parquet_file, num_row_groups=4, random_seed=42, columns=None
-):
+def read_random_parquet_row_groups(parquet_file, num_row_groups=4, random_seed=42, columns=None):
     """
     Read a random subset of row groups from a parquet file. Each row group is a set of rows that are contiguous in the file. For 10x transcripts.parquet file, each row group has about 262,000 rows.
     """
@@ -482,9 +273,7 @@ def read_random_parquet_row_groups(
         parquet_file.metadata.num_row_groups, size=num_row_groups, replace=False
     )
     # Project columns here too: without `columns` this read pulled all ~20.
-    return parquet_file.read_row_groups(
-        selected_row_groups, columns=columns
-    ).to_pandas()
+    return parquet_file.read_row_groups(selected_row_groups, columns=columns).to_pandas()
 
 
 def scaled_noise_threshold(
@@ -526,7 +315,33 @@ def scaled_noise_threshold(
     return float(threshold) * scale, scale, n_sampled, n_total
 
 
-def main():
+@dataclass
+class TranscriptQCOptions:
+    """Options for :func:`run_transcript_qc`.
+
+    Field names match the CLI flags one-for-one, so the dataclass can be built
+    straight from parsed arguments and the analysis body keeps reading
+    ``args.<name>`` unchanged.
+
+    There is deliberately no ``device`` field: this analysis is pure
+    pyarrow/pandas/scanpy streaming with no CUDA or Numba code path, so a
+    backend selector here would be a knob with no effect. GPU/CPU selection
+    belongs to :func:`spatialqc.image.run_image_qc`.
+    """
+
+    xenium_bundle_dir: str
+    outdir: str
+    non_gene_prefix: Sequence[str] = ("NegControl",)
+    stain_names: Sequence[str] | None = None
+    task_process: str = "TRANSCRIPT_QC"
+    num_row_groups: int | None = None
+    threads: int = 1
+    pipeline_segmentation: str = "skip"
+    is_resegmented: bool = False
+    seg_versions_file: Sequence[str] | None = None
+
+
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Transcript QC Processing")
     parser.add_argument(
         "--xenium-bundle-dir", required=True, help="Path to Xenium bundle directory"
@@ -550,9 +365,7 @@ def main():
         nargs="+",
         help="Stain names (unused but kept for compatibility)",
     )
-    parser.add_argument(
-        "--task-process", default="TRANSCRIPT_QC", help="Task process name"
-    )
+    parser.add_argument("--task-process", default="TRANSCRIPT_QC", help="Task process name")
     parser.add_argument(
         "--num-row-groups",
         type=int,
@@ -580,7 +393,25 @@ def main():
         "the segmentation-software label (post-seg pipeline tools)",
     )
 
-    args = parser.parse_args()
+    return parser
+
+
+def main(argv: list[str] | None = None):
+    """Command-line entry point for transcript QC.
+
+    Deliberately thin: it parses arguments and delegates. The analysis lives in
+    :func:`run_transcript_qc`, which is importable and callable directly.
+    """
+    args = _build_parser().parse_args(argv)
+    return run_transcript_qc(TranscriptQCOptions(**vars(args)))
+
+
+def run_transcript_qc(args: TranscriptQCOptions):
+    """Run the transcript QC analysis.
+
+    Args:
+        args: Parsed options; see :class:`TranscriptQCOptions`.
+    """
 
     # argparse yields a list with nargs="+", so normalise to the tuple
     # pandas' str.startswith expects for a multi-prefix test.
@@ -648,9 +479,7 @@ def main():
         # fraction (fraction of a cell's transcripts that overlap its nucleus).
         "overlaps_nucleus",
     ]
-    missing_columns = [
-        col for col in required_columns if col not in transcripts_parquet_columns
-    ]
+    missing_columns = [col for col in required_columns if col not in transcripts_parquet_columns]
     if missing_columns:
         print(f"Missing required columns in transcripts.parquet: {missing_columns}")
         sys.exit(1)
@@ -668,9 +497,7 @@ def main():
         )
         NUM_ROW_GROUPS = None
 
-    _tx = transcript_stream.aggregate_transcripts(
-        transcripts_parquet_path, BACKGROUND_CELL_ID
-    )
+    _tx = transcript_stream.aggregate_transcripts(transcripts_parquet_path, BACKGROUND_CELL_ID)
     _log_mem("after streaming aggregation")
 
     # The two QV violin plots are the only row-level consumers, and the previous
@@ -757,9 +584,7 @@ def main():
     )
     plt.ylabel("Codeword Category", fontsize=12)
     plt.xlabel("Quality Value (qv)", fontsize=12)
-    plt.title(
-        "Distribution of Transcript Quality by Codeword Category", fontsize=14, pad=20
-    )
+    plt.title("Distribution of Transcript Quality by Codeword Category", fontsize=14, pad=20)
     plt.tight_layout()
     # vertical reference line at qv=20 (matches horizontal-violin layout)
     plt.axvline(x=20, color="grey", linestyle="--")
@@ -902,12 +727,10 @@ def main():
     #
     # The right factor is over *non-gene* transcripts specifically, since that is the
     # population sampled.
-    n_mols_threshold, nongene_scale, n_nongene_sampled, n_nongene_total = (
-        scaled_noise_threshold(
-            df_spatial_nongene["feature_name"],
-            n_nongene_total=max(0, _tx.n_rows - _tx.n_gene_rows),
-            non_gene_prefixes=non_gene_prefixes,
-        )
+    n_mols_threshold, nongene_scale, n_nongene_sampled, n_nongene_total = scaled_noise_threshold(
+        df_spatial_nongene["feature_name"],
+        n_nongene_total=max(0, _tx.n_rows - _tx.n_gene_rows),
+        non_gene_prefixes=non_gene_prefixes,
     )
     print(
         f"Noise threshold for genes' transcript count: {n_mols_threshold:.0f} transcripts "
@@ -957,9 +780,7 @@ def main():
         figures_source_dir / "num_transcripts_per_feature.csv", index=True
     )
 
-    retained_genes = n_mols_per_gene_df.query(
-        "n_molecules > @n_mols_threshold and is_gene == True"
-    )
+    retained_genes = n_mols_per_gene_df.query("n_molecules > @n_mols_threshold and is_gene == True")
     print(
         f"Number of genes with a total transcript count higher than the threshold : {len(retained_genes):,}"
     )
@@ -972,9 +793,7 @@ def main():
     # Check available columns and use appropriate cell area column
     available_columns = pq.ParquetFile(cells_parquet_path).schema.names
     cell_area_column = "cell_area" if "cell_area" in available_columns else "volume"
-    cells_parquet = pd.read_parquet(
-        cells_parquet_path, columns=["cell_id", cell_area_column]
-    )
+    cells_parquet = pd.read_parquet(cells_parquet_path, columns=["cell_id", cell_area_column])
     # Rename the column for consistency
     cells_parquet.rename(columns={cell_area_column: "cell_size"}, inplace=True)
 
@@ -1067,9 +886,7 @@ def main():
     if "transcript_counts" in _cell_cols:
         _zt = pd.read_parquet(cells_parquet_path, columns=["transcript_counts"])
         pct_cells_zero_transcripts = (
-            float((_zt["transcript_counts"] == 0).mean() * 100)
-            if len(_zt) > 0
-            else None
+            float((_zt["transcript_counts"] == 0).mean() * 100) if len(_zt) > 0 else None
         )
         del _zt
     else:
@@ -1139,8 +956,7 @@ def main():
                 "nucleus_fraction": nucleus_count_fraction.values,
             }
         ).to_csv(
-            figures_source_dir
-            / "nucleus_transcript_fraction_per_cell_distribution.csv",
+            figures_source_dir / "nucleus_transcript_fraction_per_cell_distribution.csv",
             index=False,
         )
 
@@ -1161,12 +977,8 @@ def main():
         nucleus_transcript_fraction_summary = dict(_none_summary)
 
     # EXACT CODE FROM ORIGINAL NOTEBOOK - Figure 7: Nucleus-to-cell area fraction
-    cells_parquet = pd.read_parquet(
-        cells_parquet_path, columns=["nucleus_area", "cell_area"]
-    )
-    nucleus_size_fraction = cells_parquet["nucleus_area"] / (
-        cells_parquet["cell_area"] + 1
-    )
+    cells_parquet = pd.read_parquet(cells_parquet_path, columns=["nucleus_area", "cell_area"])
+    nucleus_size_fraction = cells_parquet["nucleus_area"] / (cells_parquet["cell_area"] + 1)
 
     # Figure 7 size + title style aligned with §5.1 / §5.2 / §5.4 / §5.5
     # for uniform appearance.
@@ -1188,16 +1000,12 @@ def main():
 
     # Save the plot
     plt.savefig(
-        os.path.join(
-            outdir, "figures", "nucleus_to_cell_size_fraction_per_cell_distribution.pdf"
-        ),
+        os.path.join(outdir, "figures", "nucleus_to_cell_size_fraction_per_cell_distribution.pdf"),
         dpi=300,
         bbox_inches="tight",
     )
     plt.savefig(
-        os.path.join(
-            outdir, "figures", "nucleus_to_cell_size_fraction_per_cell_distribution.png"
-        ),
+        os.path.join(outdir, "figures", "nucleus_to_cell_size_fraction_per_cell_distribution.png"),
         dpi=300,
         bbox_inches="tight",
     )
@@ -1235,12 +1043,8 @@ def main():
         plt.axvline(x=n_mols_threshold_cell, color="grey", linestyle="--")
     plt.title("Distribution of transcripts per Cell", fontsize=14, pad=20)
     plt.tight_layout()
-    plt.savefig(
-        f"{output_fig_dir}/num_transcripts_per_cell.pdf", dpi=300, bbox_inches="tight"
-    )
-    plt.savefig(
-        f"{output_fig_dir}/num_transcripts_per_cell.png", dpi=300, bbox_inches="tight"
-    )
+    plt.savefig(f"{output_fig_dir}/num_transcripts_per_cell.pdf", dpi=300, bbox_inches="tight")
+    plt.savefig(f"{output_fig_dir}/num_transcripts_per_cell.png", dpi=300, bbox_inches="tight")
     plt.close(fig)
     print(f"Threshold for transcripts per cell: {n_mols_threshold_cell}")
 
@@ -1251,9 +1055,7 @@ def main():
             "n_mols_threshold_cell": n_mols_threshold_cell,
         }
     )
-    df_transcripts_per_cell.to_csv(
-        figures_source_dir / "num_transcripts_per_cell.csv", index=False
-    )
+    df_transcripts_per_cell.to_csv(figures_source_dir / "num_transcripts_per_cell.csv", index=False)
 
     # Convert numpy array to pandas DataFrame
     n_mols_per_cell_df = pd.DataFrame(n_mols_per_cell, columns=["num_of_transcripts"])
@@ -1279,12 +1081,8 @@ def main():
     # Filenames match actual content — genes per cell; renamed from
     # num_transcripts_per_cell.* on 2026-05-22 (xlabel reads "Num. genes",
     # title is "Distribution of number of detected genes per Cell").
-    plt.savefig(
-        f"{output_fig_dir}/num_genes_per_cell.pdf", dpi=300, bbox_inches="tight"
-    )
-    plt.savefig(
-        f"{output_fig_dir}/num_genes_per_cell.png", dpi=300, bbox_inches="tight"
-    )
+    plt.savefig(f"{output_fig_dir}/num_genes_per_cell.pdf", dpi=300, bbox_inches="tight")
+    plt.savefig(f"{output_fig_dir}/num_genes_per_cell.png", dpi=300, bbox_inches="tight")
     plt.close(fig)
 
     # Save data for genes per cell — figures_source/ version is the
@@ -1366,9 +1164,7 @@ def main():
             "transcript_status": _per_fov_transcript_status(
                 int(_fov_n.loc[_fov]), float(_mol_z.loc[_fov])
             ),
-            "pct_unassigned": (
-                None if _subsampled else float(_fov_unassigned_pct.loc[_fov])
-            ),
+            "pct_unassigned": (None if _subsampled else float(_fov_unassigned_pct.loc[_fov])),
         }
         for _fov in _fov_n.index
     ]
@@ -1398,12 +1194,8 @@ def main():
 
     # Per-cell median aggregates (n_mols_per_cell + n_genes_per_cell are
     # numpy arrays defined earlier; reuse them).
-    median_transcripts_per_cell = (
-        int(np.median(n_mols_per_cell)) if len(n_mols_per_cell) > 0 else 0
-    )
-    median_genes_per_cell = (
-        int(np.median(n_genes_per_cell)) if len(n_genes_per_cell) > 0 else 0
-    )
+    median_transcripts_per_cell = int(np.median(n_mols_per_cell)) if len(n_mols_per_cell) > 0 else 0
+    median_genes_per_cell = int(np.median(n_genes_per_cell)) if len(n_genes_per_cell) > 0 else 0
 
     # Nucleus-to-cell area ratio summary (reuses nucleus_size_fraction Series
     # from the §5.3 figure block above).
@@ -1454,9 +1246,7 @@ def main():
                 "unassigned": _genes_only["n_unassigned"],
             }
         )
-        _per_gene["perc_unassigned"] = (
-            _per_gene["unassigned"] / _per_gene["total"] * 100
-        )
+        _per_gene["perc_unassigned"] = _per_gene["unassigned"] / _per_gene["total"] * 100
         _gated = _per_gene[_per_gene["total"] >= MIN_GENE_COUNT_FOR_UNASSIGNED]
         if len(_gated) > 1 and _gated["perc_unassigned"].mean() > 0:
             unassigned_per_gene_cv = float(
@@ -1466,12 +1256,8 @@ def main():
             unassigned_per_gene_cv = None
 
         # Source data for the figure (genes that passed the count gate).
-        _per_gene_out = _gated.sort_values(
-            "perc_unassigned", ascending=False
-        ).reset_index()
-        _per_gene_out.to_csv(
-            figures_source_dir / "unassigned_per_gene.csv", index=False
-        )
+        _per_gene_out = _gated.sort_values("perc_unassigned", ascending=False).reset_index()
+        _per_gene_out.to_csv(figures_source_dir / "unassigned_per_gene.csv", index=False)
 
         # Figure: per-gene distribution of unassigned fraction. The dashed line
         # marks the sample-wide rate, so genes leaking far above it stand out.
@@ -1482,12 +1268,8 @@ def main():
         plt.ylabel("Num. genes")
         plt.title("Per-gene transcript-to-cell assignment", fontsize=14, pad=20)
         plt.tight_layout()
-        plt.savefig(
-            output_fig_dir / "unassigned_per_gene.pdf", dpi=300, bbox_inches="tight"
-        )
-        plt.savefig(
-            output_fig_dir / "unassigned_per_gene.png", dpi=300, bbox_inches="tight"
-        )
+        plt.savefig(output_fig_dir / "unassigned_per_gene.pdf", dpi=300, bbox_inches="tight")
+        plt.savefig(output_fig_dir / "unassigned_per_gene.png", dpi=300, bbox_inches="tight")
         plt.close(fig)
     else:
         unassigned_per_gene_cv = None
@@ -1526,18 +1308,14 @@ def main():
         "total_features": int(_tx.n_features),
         "total_genes_count": total_genes_count,
         "filtered_genes_count": filtered_genes_count,
-        "codeword_category_counts": {
-            str(k): int(v) for k, v in codeword_category_counts.items()
-        },
+        "codeword_category_counts": {str(k): int(v) for k, v in codeword_category_counts.items()},
         "neg_control_quantile": int(n_mols_threshold),
         # None ⇒ not computable on degenerate counts (see _min_count_threshold);
         # emitted as JSON null, which the report already treats as absent.
         "min_transcripts_per_cell": (
             int(n_mols_threshold_cell) if n_mols_threshold_cell is not None else None
         ),
-        "min_genes_per_cell": (
-            int(n_genes_threshold) if n_genes_threshold is not None else None
-        ),
+        "min_genes_per_cell": (int(n_genes_threshold) if n_genes_threshold is not None else None),
         "retained_genes_count": len(retained_genes),
         "total_cells": int(ad.shape[0]),
         "analyzed_genes": int(ad.shape[1]),

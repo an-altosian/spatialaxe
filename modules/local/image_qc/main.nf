@@ -10,7 +10,10 @@ process IMAGE_QC_ANALYSIS {
     // Built from environment.yml in this directory (see the module Dockerfile).
     // Hosted on the author's quay.io namespace for now; to be migrated to the
     // nf-core org before release.
-    container "quay.io/dongzehe/image_qc:1.0.0"
+    // 2.0.0 is the first tag that carries the `spatialqc` package and therefore
+    // the `spatialqc-image-qc` console script. NOT YET BUILT: docker-profile
+    // tests fail until this image is published.
+    container "quay.io/dongzehe/image_qc:2.0.0"
 
     input:
     tuple val(meta), val(parameters), path(input_files)
@@ -19,6 +22,7 @@ process IMAGE_QC_ANALYSIS {
     output:
     tuple val(meta), path(outdir), emit: outdir
     tuple val("${task.process}"), val('python'), eval("python3 --version | sed 's/Python //'"), topic: versions, emit: versions_python
+    tuple val("${task.process}"), val('spatialqc'), eval("python3 -c 'import spatialqc; print(spatialqc.__version__)'"), topic: versions, emit: versions_spatialqc
     tuple val("${task.process}"), val('numpy'), eval("python3 -c 'import numpy; print(numpy.__version__)'"), topic: versions, emit: versions_numpy
     tuple val("${task.process}"), val('scikit-image'), eval("python3 -c 'import skimage; print(skimage.__version__)'"), topic: versions, emit: versions_skimage
 
@@ -111,6 +115,17 @@ process IMAGE_QC_ANALYSIS {
     // four. Observed on run 3nkeHOEV1ONlbK: image_qc_gpus=1 placed on a
     // g6e.12xlarge and the script reported "4 GPU(s)".
     args << "--max-gpus ${task.ext.max_gpus}"
+
+    // Compute backend, passed explicitly rather than left to autodetection: a
+    // GPU node whose driver is missing then fails the task instead of silently
+    // running the CPU path ~50x slower.
+    //
+    // Resolved in conf/modules.config, which is the only place allowed to read
+    // params.*. It must account for BOTH `use_gpu` (which gates the accelerator
+    // directive, and is false by default) and `image_qc_gpus`; deriving it from
+    // ext.max_gpus alone would demand a GPU on every default CPU run, because
+    // image_qc_gpus defaults to 1 while use_gpu defaults to false.
+    args << "--device ${task.ext.device ?: 'auto'}"
     if (task.ext.lap_sigma != null) {
         args << "--lap-sigma ${task.ext.lap_sigma}"
     }
@@ -137,7 +152,7 @@ process IMAGE_QC_ANALYSIS {
     # QC-FAILED banner. Signal / OOM / preemption codes (104, 130-145) are re-raised
     # so Nextflow's retry errorStrategy still fires.
     rc=0
-    image_qc.py \\
+    spatialqc-image-qc \\
         ${args.join(' \\\n        ')} || rc=\$?
 
     mkdir -p "${outdir}"

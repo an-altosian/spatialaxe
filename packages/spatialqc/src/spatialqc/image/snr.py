@@ -18,7 +18,7 @@ import threading
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -118,18 +118,16 @@ def is_excluded_feature(name: str) -> bool:
 def compute_image_snr_from_roi_df(
     df_grid_roi: pd.DataFrame,
     intensity_threshold: float = 0.0,
-    intensity_col: Optional[str] = None,
-    snr_thresholds: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
+    intensity_col: str | None = None,
+    snr_thresholds: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """
     Slide-level image SNR (dB) from pre-aggregated ROI intensities; same value
     conceptually applies to all tissue ROIs (SNR_plan lightweight path).
     """
     if intensity_col is None:
         intensity_col = (
-            "dapi_intensity"
-            if "dapi_intensity" in df_grid_roi.columns
-            else "raw_intensity"
+            "dapi_intensity" if "dapi_intensity" in df_grid_roi.columns else "raw_intensity"
         )
     if intensity_col not in df_grid_roi.columns:
         return {"status": "skipped", "reason": f"missing column {intensity_col!r}"}
@@ -315,11 +313,7 @@ def roi_snr_db_batch(tiles: Any, xp: Any = np) -> Any:
 
     Ks = sub.shape[0]
     flat_idx = (idx + xp.arange(Ks)[:, None] * nbins).reshape(-1)
-    counts = (
-        xp.bincount(flat_idx, minlength=Ks * nbins)
-        .reshape(Ks, nbins)
-        .astype(xp.float64)
-    )
+    counts = xp.bincount(flat_idx, minlength=Ks * nbins).reshape(Ks, nbins).astype(xp.float64)
     centers = mn_s[:, None] + (xp.arange(nbins) + 0.5) * step[:, None]
 
     # skimage.filters.threshold_otsu's histogram math, per row.
@@ -475,13 +469,13 @@ def roi_snr_db_numba(tiles: Any) -> np.ndarray:
 
 
 def compute_image_snr_from_pixel_maps(
-    focus_maps: Optional[Dict[str, Any]],
+    focus_maps: dict[str, Any] | None,
     df_grid_roi: pd.DataFrame,
     map_key: str = "dapi_mean_map",
-    max_rois: Optional[int] = None,
-    snr_thresholds: Optional[Dict[str, Any]] = None,
-    precomputed_db: Optional[Any] = None,
-) -> Dict[str, Any]:
+    max_rois: int | None = None,
+    snr_thresholds: dict[str, Any] | None = None,
+    precomputed_db: Any | None = None,
+) -> dict[str, Any]:
     """
     Per-ROI SNR_dB from pixel tiles: Otsu foreground vs background std (SNR_plan accurate path).
     Uses ``dapi_mean_map`` (or ``map_key``) slices [y1:y2, x1:x2] per ROI row.
@@ -595,9 +589,7 @@ def compute_image_snr_from_pixel_maps(
         "snr_db_mean": float(np.mean(_agg)),
         "snr_db_p25": float(np.percentile(_agg, 25)),
         "snr_db_p75": float(np.percentile(_agg, 75)),
-        "verdict": "PASS"
-        if med_db >= warn_db
-        else ("WARN" if med_db >= fail_db else "FAIL"),
+        "verdict": "PASS" if med_db >= warn_db else ("WARN" if med_db >= fail_db else "FAIL"),
     }
 
 
@@ -659,7 +651,7 @@ def transcripts_um_to_px(df_tx: pd.DataFrame, pixel_size_um: float) -> pd.DataFr
 
 def _infer_uniform_grid_strides(
     df_grid_roi: pd.DataFrame,
-) -> Optional[Tuple[int, int]]:
+) -> tuple[int, int] | None:
     """
     Infer (stride_x, stride_y) for a regular grid like ``image_qc`` (arange(0, W, stride)).
 
@@ -717,7 +709,7 @@ class _UniformRoiLookup:
     @classmethod
     def build(
         cls, df_grid_roi: pd.DataFrame, stride_x: int, stride_y: int
-    ) -> Optional["_UniformRoiLookup"]:
+    ) -> _UniformRoiLookup | None:
         x1 = df_grid_roi["x1"].to_numpy(dtype=np.int64)
         y1 = df_grid_roi["y1"].to_numpy(dtype=np.int64)
         rids = df_grid_roi["roi_id"].to_numpy(dtype=np.int32)
@@ -734,12 +726,8 @@ class _UniformRoiLookup:
     def assign(self, x_px: np.ndarray, y_px: np.ndarray) -> np.ndarray:
         """roi_id per point. Out-of-lattice coordinates clip to the edge ROI, which
         is what `_roi_grid_assign_fast_uniform` has always done."""
-        xi = (x_px.astype(np.int64, copy=False) // self._stride_x).clip(
-            0, self._max_ix - 1
-        )
-        yi = (y_px.astype(np.int64, copy=False) // self._stride_y).clip(
-            0, self._max_iy - 1
-        )
+        xi = (x_px.astype(np.int64, copy=False) // self._stride_x).clip(0, self._max_ix - 1)
+        yi = (y_px.astype(np.int64, copy=False) // self._stride_y).clip(0, self._max_iy - 1)
         return self._grid[yi, xi]
 
 
@@ -749,7 +737,7 @@ def _roi_grid_assign_fast_uniform(
     y_px: np.ndarray,
     stride_x: int,
     stride_y: int,
-) -> Optional[np.ndarray]:
+) -> np.ndarray | None:
     """
     O(n_tx) assignment: tile index from pixel coords, lookup pre-filled roi_id grid.
 
@@ -765,7 +753,7 @@ def _roi_grid_assign(
     df_grid_roi: pd.DataFrame,
     x_px: np.ndarray,
     y_px: np.ndarray,
-    stride_xy: Optional[Tuple[int, int]] = None,
+    stride_xy: tuple[int, int] | None = None,
 ) -> np.ndarray:
     """
     Assign each transcript pixel to ``roi_id``, or -1.
@@ -807,9 +795,7 @@ def _roi_grid_assign(
                 int(x_px.shape[0]),
             )
             return fast
-        logger.info(
-            "SNR ROI assignment: inferred stride rejected (collision); using slow path"
-        )
+        logger.info("SNR ROI assignment: inferred stride rejected (collision); using slow path")
 
     rid_out = np.full(x_px.shape[0], -1, dtype=np.int32)
     rids = df_grid_roi["roi_id"].to_numpy(dtype=np.int32)
@@ -881,11 +867,11 @@ def _accumulate_roi_tx_counts(
     x_px: np.ndarray,
     y_px: np.ndarray,
     is_neg: np.ndarray,
-    counters: Tuple[np.ndarray, np.ndarray, np.ndarray],
-    stride_xy: Optional[Tuple[int, int]],
-    lookup: Optional["_UniformRoiLookup"] = None,
+    counters: tuple[np.ndarray, np.ndarray, np.ndarray],
+    stride_xy: tuple[int, int] | None,
+    lookup: _UniformRoiLookup | None = None,
     roi_id_is_arange: bool = False,
-    is_excluded: Optional[np.ndarray] = None,
+    is_excluded: np.ndarray | None = None,
 ) -> None:
     """Fold one batch of transcripts into the per-ROI counters.
 
@@ -935,10 +921,10 @@ def _stream_roi_tx_counts(
     row_ix: pd.Series,
     path: Path,
     pixel_size_um: float,
-    stride_xy: Optional[Tuple[int, int]],
+    stride_xy: tuple[int, int] | None,
     batch_rows: int = ROI_TX_BATCH_ROWS,
     roi_id_is_arange: bool = False,
-) -> Tuple[Tuple[np.ndarray, np.ndarray, np.ndarray], int]:
+) -> tuple[tuple[np.ndarray, np.ndarray, np.ndarray], int]:
     """Per-ROI real/neg/total transcript counts, read in batches, folded in parallel.
 
     The whole-frame version materialised ``feature_name``, ``x_location`` and
@@ -967,13 +953,9 @@ def _stream_roi_tx_counts(
     # not a lattice, and each batch falls back to the general assignment.
     lookup = None
     if stride_xy is not None and stride_xy[0] > 0 and stride_xy[1] > 0:
-        lookup = _UniformRoiLookup.build(
-            df_grid_roi, int(stride_xy[0]), int(stride_xy[1])
-        )
+        lookup = _UniformRoiLookup.build(df_grid_roi, int(stride_xy[0]), int(stride_xy[1]))
     if lookup is None:
-        logger.info(
-            "SNR ROI assignment: no uniform lattice; assigning per batch (slower)"
-        )
+        logger.info("SNR ROI assignment: no uniform lattice; assigning per batch (slower)")
 
     handle = pq.ParquetFile(str(path))
     columns = ["feature_name", "x_location", "y_location"]
@@ -988,7 +970,7 @@ def _stream_roi_tx_counts(
     # One counter triple per worker thread. Registered under a lock the first time a
     # thread runs, so the main thread can sum them after the pool drains.
     tls = threading.local()
-    partials: List[Tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+    partials: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
     partials_lock = threading.Lock()
 
     def _fold_one(batch) -> int:
@@ -1052,16 +1034,16 @@ def _stream_roi_tx_counts(
 
 def compute_roi_snr(
     df_grid_roi: pd.DataFrame,
-    df_tx: Optional[pd.DataFrame] = None,
+    df_tx: pd.DataFrame | None = None,
     x_col: str = "x_px",
     y_col: str = "y_px",
-    roi_grid_stride: Optional[Tuple[int, int]] = None,
-    snr_thresholds: Optional[Dict[str, Any]] = None,
+    roi_grid_stride: tuple[int, int] | None = None,
+    snr_thresholds: dict[str, Any] | None = None,
     *,
-    transcripts_path: Optional[Path] = None,
-    pixel_size_um: Optional[float] = None,
+    transcripts_path: Path | None = None,
+    pixel_size_um: float | None = None,
     batch_rows: int = ROI_TX_BATCH_ROWS,
-) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+) -> tuple[pd.DataFrame, dict[str, Any]]:
     """
     Per-ROI real vs neg transcript counts, ratio, neg_pct; **mutates** *df_grid_roi* in place
     (caller should pass a copy if the original must stay unchanged — ``run_snr_module`` does).
@@ -1204,8 +1186,8 @@ def compute_neg_spatial_autocorrelation(
     moran_subsample_seed: int = 42,
     *,
     include_moran: bool = False,
-    snr_thresholds: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
+    snr_thresholds: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """
     SNR_plan: Moran's I with 4-neighbour weights if libpysal/esda available;
     else quadrant variance proxy on neg_pct.
@@ -1254,7 +1236,7 @@ def compute_neg_spatial_autocorrelation(
     if spread > qs_fail:
         q_verdict = "FAIL"
 
-    out: Dict[str, Any] = {
+    out: dict[str, Any] = {
         "status": "ok",
         "method_primary": "quadrant_spread",
         "quadrant_neg_pct_means": quad.tolist(),
@@ -1341,7 +1323,7 @@ def compute_neg_spatial_autocorrelation(
 
 def load_expression_matrix_h5(
     path: Path,
-) -> Tuple[Any, List[str], List[str], Dict[str, Any]]:
+) -> tuple[Any, list[str], list[str], dict[str, Any]]:
     """
     Load 10x-style Xenium h5 sparse matrix [features x cells].
 
@@ -1352,7 +1334,7 @@ def load_expression_matrix_h5(
     import h5py
 
     path = Path(path)
-    meta: Dict[str, Any] = {"path": str(path)}
+    meta: dict[str, Any] = {"path": str(path)}
     with h5py.File(path, "r") as f:
         if "matrix" in f:
             g = f["matrix"]
@@ -1366,14 +1348,10 @@ def load_expression_matrix_h5(
             from scipy.sparse import csc_matrix, csr_matrix  # type: ignore
 
             if len(indptr) == n_feat + 1:
-                mat = csr_matrix(
-                    (data, indices, indptr), shape=shape_t, dtype=np.float64
-                )
+                mat = csr_matrix((data, indices, indptr), shape=shape_t, dtype=np.float64)
                 meta["sparse_layout"] = "csr"
             elif len(indptr) == n_cell + 1:
-                mat = csc_matrix(
-                    (data, indices, indptr), shape=shape_t, dtype=np.float64
-                ).tocsr()
+                mat = csc_matrix((data, indices, indptr), shape=shape_t, dtype=np.float64).tocsr()
                 meta["sparse_layout"] = "csc_assembled_csr"
             else:
                 raise ValueError(
@@ -1389,8 +1367,7 @@ def load_expression_matrix_h5(
             names = [x.decode() if isinstance(x, bytes) else str(x) for x in raw]
             if "feature_type" in fg:
                 ftype = [
-                    x.decode() if isinstance(x, bytes) else str(x)
-                    for x in fg["feature_type"][:]
+                    x.decode() if isinstance(x, bytes) else str(x) for x in fg["feature_type"][:]
                 ]
             else:
                 ftype = ["Gene Expression"] * len(names)
@@ -1425,7 +1402,7 @@ def _mean_per_feature(feature_by_cell: Any) -> np.ndarray:
     return np.asarray(out, dtype=np.float64).ravel()
 
 
-def _build_feature_masks(feature_names: List[str]) -> tuple[np.ndarray, np.ndarray]:
+def _build_feature_masks(feature_names: list[str]) -> tuple[np.ndarray, np.ndarray]:
     """Signal / background masks for the slide expression matrix.
 
     ``is_real`` is NOT simply ``~is_neg``: features matching
@@ -1441,9 +1418,9 @@ def _build_feature_masks(feature_names: List[str]) -> tuple[np.ndarray, np.ndarr
 
 def compute_slide_snr_plummer_corrected(
     mat: Any,
-    feature_names: List[str],
-    snr_thresholds: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
+    feature_names: list[str],
+    snr_thresholds: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """
     Slide SNR: log10(mean_real + 0.1) - log10(mean_neg + 0.1) over matrix elements
     (features × cells), real vs neg probe subsets.
@@ -1462,9 +1439,7 @@ def compute_slide_snr_plummer_corrected(
     snr = float(log_real - log_neg)
 
     real_feature_means = _mean_per_feature(real_mat)
-    dynamic_range = float(
-        math.log10(float(real_feature_means.max()) + PSEUDOCOUNT) - log_neg
-    )
+    dynamic_range = float(math.log10(float(real_feature_means.max()) + PSEUDOCOUNT) - log_neg)
     noise_floor_pct = float(mean_neg / (mean_real + EPS) * 100.0)
 
     _t = snr_thresholds or {}
@@ -1500,9 +1475,9 @@ def compute_slide_snr_plummer_corrected(
 
 def compute_slide_snr_spatialqm_corrected(
     mat: Any,
-    feature_names: List[str],
-    snr_thresholds: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
+    feature_names: list[str],
+    snr_thresholds: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """
     Per-gene variant: snr_g = log10(mean_gene_g + 0.1) - log10(mean_neg + 0.1); slide_snr = mean(snr_g).
     """
@@ -1521,9 +1496,7 @@ def compute_slide_snr_spatialqm_corrected(
     snr_median = float(np.median(per_gene_snr))
     snr_p10 = float(np.percentile(per_gene_snr, 10))
     pct_genes_above_neg = float(np.mean(per_gene_snr > 0.0) * 100.0)
-    dynamic_range = float(
-        math.log10(float(real_feature_means.max()) + PSEUDOCOUNT) - log_neg
-    )
+    dynamic_range = float(math.log10(float(real_feature_means.max()) + PSEUDOCOUNT) - log_neg)
 
     _t = snr_thresholds or {}
     _sq = _t.get("slide_spatialqm") or {}
@@ -1537,9 +1510,7 @@ def compute_slide_snr_spatialqm_corrected(
         # Legacy: snr_mean
         verdict_value = snr_mean
     verdict = (
-        "PASS"
-        if verdict_value >= sq_warn
-        else ("WARN" if verdict_value >= sq_fail else "FAIL")
+        "PASS" if verdict_value >= sq_warn else ("WARN" if verdict_value >= sq_fail else "FAIL")
     )
 
     return {
@@ -1572,7 +1543,7 @@ def save_snr_roi_tx_table(
     outdir: Path,
     *,
     basename: str = SNR_ROI_TX_TABLE_BASENAME,
-) -> Optional[Path]:
+) -> Path | None:
     """
     Persist the grid with ``compute_roi_snr`` columns (``snr_real_tx``, ``snr_neg_tx``,
     ``snr_total_tx``, ``neg_pct``, ``roi_tx_snr_ratio``, …) for downstream plots.
@@ -1601,7 +1572,7 @@ def save_snr_roi_tx_table(
         return None
 
 
-def _write_snr_json(summary: Dict[str, Any], outdir: Path) -> None:
+def _write_snr_json(summary: dict[str, Any], outdir: Path) -> None:
     """Write snr_metrics.json, refusing to emit a bare NaN token.
 
     ``json.dump(..., default=str)`` does NOT catch float NaN: ``default`` only fires
@@ -1629,7 +1600,7 @@ def _write_snr_json(summary: Dict[str, Any], outdir: Path) -> None:
         logger.warning("Could not write snr_metrics.json: %s", e)
 
 
-def aggregate_snr_verdict(parts: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+def aggregate_snr_verdict(parts: dict[str, dict[str, Any]]) -> dict[str, Any]:
     """Any FAIL → overall FAIL; clustered neg (FAIL) escalates WARN → FAIL.
 
     Components that could not run return ``{"status": "skipped"/"error"}`` with no
@@ -1662,29 +1633,29 @@ def aggregate_snr_verdict(parts: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
         overall = "FAIL"
     if n_verdicts == 0:
         overall = "NOT_COMPUTED"
-    out: Dict[str, Any] = {"overall_snr_verdict": overall}
+    out: dict[str, Any] = {"overall_snr_verdict": overall}
     if not_computed:
         out["components_not_computed"] = sorted(not_computed)
     return out
 
 
 def run_snr_module(
-    xenium_bundle_dir: Optional[Path],
+    xenium_bundle_dir: Path | None,
     df_grid_roi: pd.DataFrame,
     outdir: Path,
-    focus_maps: Optional[Dict[str, Any]] = None,
-    roi_snr_db: Optional[Any] = None,
+    focus_maps: dict[str, Any] | None = None,
+    roi_snr_db: Any | None = None,
     intensity_threshold: float = 0.0,
-    transcripts_path: Optional[Path] = None,
-    cell_matrix_h5: Optional[Path] = None,
-    pixel_size_um: Optional[float] = None,
-    otsu_max_rois: Optional[int] = None,
+    transcripts_path: Path | None = None,
+    cell_matrix_h5: Path | None = None,
+    pixel_size_um: float | None = None,
+    otsu_max_rois: int | None = None,
     save_roi_tx_table: bool = True,
     write_snr_json: bool = True,
     snr_include_moran: bool = False,
-    roi_grid_stride: Optional[Tuple[int, int]] = None,
-    snr_thresholds: Optional[Dict[str, Any]] = None,
-) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    roi_grid_stride: tuple[int, int] | None = None,
+    snr_thresholds: dict[str, Any] | None = None,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
     """
     Run all SNR sub-components; returns grid (with transcript columns when computed) and summary dict.
 
@@ -1703,7 +1674,7 @@ def run_snr_module(
     bundle = Path(xenium_bundle_dir) if xenium_bundle_dir else None
 
     df = df_grid_roi.copy()
-    parts: Dict[str, Dict[str, Any]] = {}
+    parts: dict[str, dict[str, Any]] = {}
 
     thresholds = snr_thresholds or {}
 
@@ -1814,7 +1785,7 @@ def run_snr_module(
     return df, summary
 
 
-def read_xenium_pixel_size_um(bundle_dir: Path) -> Optional[float]:
+def read_xenium_pixel_size_um(bundle_dir: Path) -> float | None:
     """Read ``pixel_size`` (or ``pixel_size_um``) from ``experiment.xenium``."""
     exp = Path(bundle_dir) / "experiment.xenium"
     if not exp.is_file():
@@ -1835,17 +1806,17 @@ def compute_snr_summary(
     *,
     bundle_dir: Path,
     outdir: Path,
-    focus_maps: Optional[Dict[str, Any]] = None,
-    roi_snr_db: Optional[Any] = None,
-    pixel_size_um: Optional[float] = None,
+    focus_maps: dict[str, Any] | None = None,
+    roi_snr_db: Any | None = None,
+    pixel_size_um: float | None = None,
     intensity_threshold: float = 0.0,
-    otsu_max_rois: Optional[int] = None,
+    otsu_max_rois: int | None = None,
     save_roi_tx_table: bool = True,
     write_snr_json: bool = True,
     snr_include_moran: bool = False,
-    roi_grid_stride: Optional[Tuple[int, int]] = None,
-    snr_thresholds: Optional[Dict[str, Any]] = None,
-) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    roi_grid_stride: tuple[int, int] | None = None,
+    snr_thresholds: dict[str, Any] | None = None,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
     """High-level API for :mod:`image_qc` — same as :func:`run_snr_module` with keyword-only opts."""
     return run_snr_module(
         bundle_dir,

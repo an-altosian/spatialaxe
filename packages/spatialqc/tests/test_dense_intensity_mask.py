@@ -23,17 +23,11 @@ identity -- which is precisely why its tests could never observe this.
 
 from __future__ import annotations
 
-import importlib
 import sys
 import types
-from pathlib import Path
 
 import numpy as np
 import pytest
-
-_bin_dir = Path(__file__).resolve().parent.parent
-if str(_bin_dir) not in sys.path:
-    sys.path.insert(0, str(_bin_dir))
 
 # Stub the heavy optional imports image_qc pulls in at module level. scanpy is
 # stubbed for the same reason test_cell_roi_mapping.py does it: importing it here
@@ -57,9 +51,9 @@ _nsitk.signed_maurer_distance_map = lambda x: np.zeros_like(  # type: ignore[att
 # swaps in the spy; this identity stand-in matches test_generate_tissue_mask.py.
 _nsitk.binary_fill_holes = lambda x: np.asarray(x)  # type: ignore[attr-defined]
 
-image_qc = importlib.import_module("image_qc")
+from spatialqc.image import qc as image_qc  # noqa: E402  (needs the stubs above)
 
-KW = dict(min_size_edge=10, min_size_hole=5, min_size_dense_intensity_region=5)
+KW = {"min_size_edge": 10, "min_size_hole": 5, "min_size_dense_intensity_region": 5}
 SHAPE = (64, 64)
 
 
@@ -130,8 +124,7 @@ def test_multi_channel_bright_pixels_reach_the_fill_filter(fill_spy, n_bright):
         "the multi-channel-bright pixels."
     )
     assert arg[20:30, 20:30].all(), (
-        f"a patch bright in {n_bright} of 3 channels is not foreground in the "
-        "artefact mask"
+        f"a patch bright in {n_bright} of 3 channels is not foreground in the artefact mask"
     )
 
 

@@ -56,14 +56,17 @@ image = [
   "h5py>=3.11",
   "matplotlib>=3.9",
   "seaborn>=0.13",
-]
-# Optional napari plugins used only by the per-cell texture/regionprops path.
-# Split out because they drag in a vispy/OpenGL stack that headless CI does not
-# need and that conflicts with minimal container images.
-image-regionprops = [
+  # Required, not optional: generate_tissue_mask uses nsitk's
+  # signed_maurer_distance_map and binary_fill_holes on the core tissue-mask
+  # path that every image QC run takes. Imported inside that function because
+  # its vispy chain dlopens libGLESv2, which a headless host may not have;
+  # conda environments additionally need `libgles` for that dlopen to resolve.
   "napari-simpleitk-image-processing>=0.4.9",
-  "napari-skimage-regionprops>=0.10.1",
 ]
+# Needed only by the legacy --legacy-focus path, which calls
+# napari_skimage_regionprops.regionprops_table on a materialised label array.
+# The streaming default path never imports it.
+image-regionprops = ["napari-skimage-regionprops>=0.10.1"]
 # Spatial autocorrelation (Moran's I) for the negative-probe SNR metric.
 spatial-stats = ["esda>=2.5", "libpysal>=4.9"]
 # Transcript QC: cell-feature-matrix reading and per-cell summaries.
@@ -95,8 +98,10 @@ Issues = "https://github.com/altos-labs/spatialqc/issues"
 [project.scripts]
 # Console scripts replace the chmod-755 `bin/*.py` pattern: pip puts these on
 # PATH, so a Nextflow module swaps one command token and nothing else.
-spatialqc-image-qc = "spatialqc.cli.image_qc:main"
-spatialqc-transcript-qc = "spatialqc.cli.transcript_qc:main"
+# They point straight at each module's thin `main`; a separate cli/ package
+# would be an indirection used exactly once.
+spatialqc-image-qc = "spatialqc.image.qc:main"
+spatialqc-transcript-qc = "spatialqc.transcript.qc:main"
 
 [tool.setuptools.dynamic]
 version = { attr = "spatialqc.__version__" }
@@ -125,8 +130,11 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 # The ported QC modules keep upstream structure verbatim; flagging their
 # complexity would only produce noise we have agreed not to act on.
-"src/spatialqc/image/qc.py" = ["B", "SIM", "E741"]
-"src/spatialqc/transcript/qc.py" = ["B", "SIM", "E741"]
+# C408 is exempted because every occurrence is `bbox=dict(boxstyle=...)` or a
+# similar matplotlib kwargs mapping, which is the idiom matplotlib's own
+# documentation uses; rewriting 16 of them inside a 14k-line module is churn.
+"src/spatialqc/image/qc.py" = ["B", "SIM", "E741", "C408"]
+"src/spatialqc/transcript/qc.py" = ["B", "SIM", "E741", "C408"]
 "tests/*" = ["B011"]
 
 [tool.ruff.format]

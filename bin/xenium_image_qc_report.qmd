@@ -637,7 +637,7 @@ _gmm_reliable = (
 # with 1d first the 2D branch was dead code and a 1D number was graded against a 2D
 # yardstick. Measured on 11 calibration samples: 2 FAIL -> WARN, 2 WARN -> PASS, nothing
 # degrades; direction is sample-dependent (5 up, 6 down). blur_gmm_2d is genuinely
-# optional (image_qc.py:8611), so the 1d fallback stays. See
+# optional (spatialqc.image.qc:8611), so the 1d fallback stays. See
 # docs/plans/2026-08-24_SPIKE_blur-precedence.md.
 blur = roi_metrics.get("blur_gmm_2d") or roi_metrics.get("blur_gmm_1d")
 
@@ -905,13 +905,13 @@ The tissue analysis generates whole-sample masks and identifies problematic regi
 # `edge_distance_threshold_px_ds` and `hole_distance_threshold_px_ds` are
 # negative downsampled-pixel signed-distance thresholds; |value| × 8 × 0.2125
 # converts to µm of inward-band depth from the boundary. Defaults match
-# bin/image_qc.py:4443-4444 (-25.0).
+# spatialqc.image.qc:4443-4444 (-25.0).
 #
 # TODO (future): `_XENIUM_PX_UM = 0.2125` is hardcoded here, in
-# `bin/image_qc.py:70`, and at `qmd:1167`. The authoritative value for this
+# `spatialqc.image.qc:70`, and at `qmd:1167`. The authoritative value for this
 # sample's instrument lives in the bundle's `experiment.xenium` `pixel_size`
 # field. When ready, emit `pixel_size_um` in roi_qc_metrics.json from
-# bin/image_qc.py and read it here instead of hardcoding.
+# spatialqc.image.qc and read it here instead of hardcoding.
 _morph = roi_metrics.get("morphology") or {}
 _DS_FACTOR = 8
 _XENIUM_PX_UM = 0.2125
@@ -1323,7 +1323,7 @@ This section assesses image quality at the tile level: a regular grid of square 
 ```{python roi-grid-parameters}
 #| echo: false
 
-# Xenium morphology base pixel size — see XENIUM_PIXEL_SIZE_UM in bin/image_qc.py
+# Xenium morphology base pixel size — see XENIUM_PIXEL_SIZE_UM in spatialqc.image.qc
 _XENIUM_PIXEL_SIZE_UM = 0.2125
 
 rows = []
@@ -2907,7 +2907,7 @@ A cluster composed largely of blurry or low-nuclear-texture cells is likely defi
     # gmm_focus_vs_transcripts, spatial_comparison) + v3's 9.D figures
     # (nuclear_texture_proportions, nuclear_texture_density, tile_blur_proportions_roi).
     # v3 9.C / 9.D / 9.E and the UMAP overlay block all dissolved — UMAP figures
-    # remain unsurfaced latent artefacts produced by bin/image_qc.py.
+    # remain unsurfaced latent artefacts produced by spatialqc.image.qc.
     # v4 r5: spatial_comparison_nuclei_vs_roi (2-panel CCFS-vs-tile-focus) is
     # now also latent — split-replaced by single-panel `tile_focus_gmm_spatial`
     # (right side only; CCFS side was dropped per user feedback as concordance
@@ -3032,10 +3032,10 @@ The correlation is tissue-dependent. Mildly positive in most tissues, but can fl
     #      whole-sample blurry-cell rate is high (reuses the §4.2 advisory gate
     #      pct_blurred_gmm_2d_roi_warn, default 20%). It fires even when no
     #      single cluster stands out, which is the broadly-blurry case.
-    #  (2) a per-cluster WARN for clusters flagged as outliers by image_qc.py
+    #  (2) a per-cluster WARN for clusters flagged as outliers by spatialqc.image.qc
     #      (cluster_blur_outliers / cluster_ccfs_outliers). The QMD only tests
     #      membership; the detection rule (robust MAD z-score + 15% floor) lives
-    #      in bin/image_qc.py so the producer and this report never drift.
+    #      in spatialqc.image.qc so the producer and this report never drift.
     _cluster_blur = cell_metrics.get("cluster_blur")
     _cluster_ccfs = cell_metrics.get("cluster_ccfs")
     _blur_outliers = cell_metrics.get("cluster_blur_outliers") or {}
@@ -3190,7 +3190,7 @@ else:
     _versions_one_line = "— (versions.yml not found)"
 
 _seg_sw = roi_metrics.get("segmentation_software") or "—"
-# XOA (onboard analysis) version, emitted by image_qc.py from the bundle's
+# XOA (onboard analysis) version, emitted by spatialqc.image.qc from the bundle's
 # experiment.xenium. Strip the "xenium-" prefix for display. Blank on bundles
 # processed before this field was added — reprocess to populate.
 _xoa_raw = roi_metrics.get("xoa_version")

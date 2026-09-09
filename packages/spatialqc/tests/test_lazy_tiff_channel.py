@@ -20,7 +20,6 @@ same branch also omits (those are getattr-guarded, so they were never fatal).
 
 from __future__ import annotations
 
-import importlib
 import sys
 import types
 
@@ -37,7 +36,8 @@ for _mod in (
 sys.modules["napari_skimage_regionprops"].regionprops_table = lambda *a, **kw: None  # type: ignore[attr-defined]
 sys.modules["scanpy"].AnnData = object  # type: ignore[attr-defined]
 
-image_qc = importlib.import_module("image_qc")
+from spatialqc.image import qc as image_qc  # noqa: E402  (needs the stubs above)
+
 _LazyTiffChannel = image_qc._LazyTiffChannel
 
 

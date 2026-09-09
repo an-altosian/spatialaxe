@@ -21,26 +21,16 @@ they measure, rather than pinning dB values, so they cannot enshrine a scope err
 
 from __future__ import annotations
 
-import importlib
-import importlib.util
-from pathlib import Path
 import json
 
 import numpy as np
 import pandas as pd
 
-# snr_metrics is stubbed by other test modules (they share sys.modules), so a plain
-# import can hand back an empty ModuleType depending on collection order. Load the
-# real module by path, the same way test_tile_consumers.py does, so this file works
-# whatever ran first.
-_snr_path = (
-    Path(__file__).resolve().parent.parent / "snr_metrics.py"
-)
-_spec = importlib.util.spec_from_file_location("_real_snr_metrics", _snr_path)
-assert _spec is not None and _spec.loader is not None  # narrow for mypy; path is checked above
-snr_metrics = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(snr_metrics)
-
+# The module comes from the installed package under its real dotted name, so the
+# bare `snr_metrics` ModuleType that other test modules park in sys.modules can no
+# longer shadow it. The previous spec_from_file_location dance existed only to
+# dodge that shadowing and is gone.
+from spatialqc.image import snr as snr_metrics
 
 # ---------------------------------------------------------------------------
 # aggregate_snr_verdict
@@ -207,9 +197,7 @@ def test_declines_rather_than_grading_a_slide_with_no_tissue():
     assert "verdict" not in out, "a verdict here would be graded on background"
     # and the aggregate must therefore not call it PASS
     assert (
-        snr_metrics.aggregate_snr_verdict({"SNR_image_otsu": out})[
-            "overall_snr_verdict"
-        ]
+        snr_metrics.aggregate_snr_verdict({"SNR_image_otsu": out})["overall_snr_verdict"]
         == "NOT_COMPUTED"
     )
 

@@ -46,6 +46,11 @@ dependencies:
   # GPU acceleration (optional at runtime). cupy imports are guarded by try/except
   # in image_qc.py, so this environment also runs correctly on CPU-only hosts.
   - pip:
+      # The QC analysis itself. Pinned exactly so a pipeline commit reproduces a
+      # run: a floating version would make the pipeline non-reproducible even at
+      # a fixed revision. The scientific stack it needs is already installed
+      # above by conda, so pip resolves these extras as satisfied.
+      - spatialqc[image,image-regionprops,spatial-stats]==0.1.0
       - cupy-cuda12x==14.0.1
       - nvidia-cuda-nvrtc-cu12==12.9.86
       - nvidia-cuda-runtime-cu12==12.9.79

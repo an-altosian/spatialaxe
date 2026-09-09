@@ -26,7 +26,6 @@ identical.
 
 from __future__ import annotations
 
-import importlib
 import sys
 import types
 
@@ -34,9 +33,10 @@ import numpy as np
 import pandas as pd
 import pytest
 
-# image_qc.py has heavy top-level imports (napari, snr_metrics, etc.) not needed
-# for the pure function under test. Stub them before importing, matching
-# test_cluster_outliers.py. Import paths come from tests/conftest.py.
+# spatialqc.image.qc has heavy optional imports (napari) not needed for the pure
+# function under test. Stub them before importing, matching
+# test_cluster_outliers.py. The module itself is imported from the installed
+# package -- no sys.path manipulation.
 _stubs = [
     "napari_skimage_regionprops",
     "napari_simpleitk_image_processing",
@@ -49,7 +49,8 @@ for _mod in _stubs:
 sys.modules["napari_skimage_regionprops"].regionprops_table = lambda *a, **kw: None  # type: ignore[attr-defined]
 sys.modules["scanpy"].AnnData = object  # type: ignore[attr-defined]
 
-image_qc = importlib.import_module("image_qc")
+from spatialqc.image import qc as image_qc  # noqa: E402  (needs the stubs above)
+
 map_grid_roi_to_cells = image_qc.map_grid_roi_to_cells
 
 STRIDE = 35

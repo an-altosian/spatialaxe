@@ -1798,7 +1798,7 @@ display(fig_html("figures/num_genes_per_cell.png"))
 _xb = XENIUM_BUNDLE if XENIUM_BUNDLE else "—"
 _outdir = SAMPLE_PUBLISHED_OUTDIR if SAMPLE_PUBLISHED_OUTDIR else INDIR
 _seg_sw = qc_metrics.get("segmentation_software") or "—"
-# XOA (onboard analysis) version, emitted by transcript_qc_processing.py from the
+# XOA (onboard analysis) version, emitted by spatialqc.transcript.qc from the
 # bundle's experiment.xenium. Strip the "xenium-" prefix; blank on bundles
 # processed before this field was added (reprocess to populate).
 _xoa_raw = qc_metrics.get("xoa_version")

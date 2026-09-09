@@ -2,30 +2,30 @@
 
 Covers the new code paths:
 1. ``read_xenium_major_version`` — XOA version detection for per-version
-   intensity floors (inlined helper block in ``image_qc``).
+   intensity floors (defined in ``spatialqc.bundle``, re-exported by
+   ``spatialqc.image.qc``).
 2. ``read_bundle_metrics`` / ``_csv_float`` / ``_csv_str`` — the three
    10x-defined gates read from metrics_summary.csv, with the critical
-   absent-vs-zero distinction (``transcript_qc_processing``).
+   absent-vs-zero distinction (``spatialqc.transcript.qc``).
 3. ``assess_raw_intensity_quality`` — WARN-only intensity (no FAIL tier).
 
 ADAPTED FROM UPSTREAM (nf-xenium-processing dev HEAD 5e35cae,
 ``tests/test_qc_threshold_refinements.py``):
-- ``xenium_helpers`` is not shipped by this pipeline; its helpers are inlined
-  into the scripts, so ``read_xenium_major_version`` is an attribute of the
-  ``image_qc`` module (``transcript_qc_processing`` deliberately omits it).
-  The ``utils = importlib.import_module("xenium_helpers.utils")`` handle and its
+- ``xenium_helpers`` is not shipped; the bundle readers live in
+  ``spatialqc.bundle``, the single copy shared by the image and transcript
+  analyses, and ``spatialqc.image.qc`` re-exports them. The
+  ``utils = importlib.import_module("xenium_helpers.utils")`` handle and its
   ``sys.path`` entry are therefore gone, and ``utils.read_xenium_major_version``
   is now ``image_qc.read_xenium_major_version``.
-- ``molecule_qc_processing`` is named ``transcript_qc_processing`` here; the
+- ``molecule_qc_processing`` is named ``spatialqc.transcript.qc`` here; the
   ``mqc`` alias is kept and repointed.
-- Scripts live in the pipeline-level ``bin/`` rather than
-  ``modules/local/*/resources/usr/bin/``.
+- The modules come from the installed ``spatialqc`` distribution rather than
+  from ``modules/local/*/resources/usr/bin/``.
 No assertion was changed.
 """
 
 from __future__ import annotations
 
-import importlib
 import sys
 import types
 from pathlib import Path
@@ -33,11 +33,8 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-# bin modules have heavy optional top-level imports (napari, snr_metrics) that
-# are not needed here. Stub them before importing, matching test_focus_score_compute.
-_bin_dir = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(_bin_dir))
-
+# The QC modules have heavy optional top-level imports (napari) that are not
+# needed here. Stub them before importing, matching test_focus_score_compute.
 for _mod in (
     "napari_skimage_regionprops",
     "napari_simpleitk_image_processing",
@@ -47,8 +44,8 @@ for _mod in (
         sys.modules[_mod] = types.ModuleType(_mod)
 sys.modules["napari_skimage_regionprops"].regionprops_table = lambda *a, **kw: None  # type: ignore[attr-defined]
 
-mqc = importlib.import_module("transcript_qc_processing")
-image_qc = importlib.import_module("image_qc")
+from spatialqc.image import qc as image_qc  # noqa: E402  (needs the stubs above)
+from spatialqc.transcript import qc as mqc  # noqa: E402  (needs the stubs above)
 
 
 # ---------------------------------------------------------------------------
@@ -98,8 +95,7 @@ def test_csv_float_distinguishes_absent_from_zero():
 
 def test_csv_str_blank_is_none():
     assert (
-        mqc._csv_str("xenium_cell_segmentation_stains_v1")
-        == "xenium_cell_segmentation_stains_v1"
+        mqc._csv_str("xenium_cell_segmentation_stains_v1") == "xenium_cell_segmentation_stains_v1"
     )
     assert mqc._csv_str("") is None
     assert mqc._csv_str(None) is None

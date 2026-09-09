@@ -12,48 +12,47 @@ Author: Hanneke Okkenhaug, Malwina Prater
 
 from __future__ import annotations
 
+import json
 import logging
-from dataclasses import dataclass
 import math
+import multiprocessing
+import multiprocessing.connection
 import os
 import queue
+import shutil
 import sys
 import threading
 import time
 import traceback
 import warnings
-import click
-import json
-import numpy as np
-import pandas as pd
-import tifffile
-import zarr
-from pathlib import Path
-import matplotlib.pyplot as plt
-from napari_skimage_regionprops import regionprops_table
-from skimage.segmentation import clear_border
-from skimage import measure, color, morphology
-from skimage.filters import apply_hysteresis_threshold, threshold_otsu
-import napari_simpleitk_image_processing as nsitk
-import seaborn as sns
-from sklearn.preprocessing import RobustScaler
-from tifffile import imread
-import multiprocessing
-import multiprocessing.connection
-import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Dict, Optional
-from numpy.typing import NDArray
-from scipy.ndimage import gaussian_laplace as scipy_gaussian_laplace
-from scipy.ndimage import laplace as scipy_laplace
-from scipy.ndimage import uniform_filter as scipy_uniform_filter
-from scipy import ndimage
-from sklearn.mixture import GaussianMixture
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
-import snr_metrics
+import click
 
 # Set matplotlib to use a non-interactive backend
 import matplotlib
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import tifffile
+import zarr
+from numpy.typing import NDArray
+from scipy import ndimage
+from scipy.ndimage import gaussian_laplace as scipy_gaussian_laplace
+from scipy.ndimage import laplace as scipy_laplace
+from scipy.ndimage import uniform_filter as scipy_uniform_filter
+from skimage import color, measure, morphology
+from skimage.filters import apply_hysteresis_threshold, threshold_otsu
+from skimage.segmentation import clear_border
+from sklearn.mixture import GaussianMixture
+from sklearn.preprocessing import RobustScaler
+from tifffile import imread
+
+from spatialqc.image import snr as snr_metrics
 
 matplotlib.use("Agg")
 
@@ -61,14 +60,27 @@ matplotlib.use("Agg")
 try:
     import cupy as cp  # type: ignore[import-untyped]
     import cupyx.scipy.ndimage  # type: ignore[import-untyped]  # noqa: F401  (binds `cupyx` for warmup)
+
+    # Fused Gaussian-second-derivative filter, matching
+    # scipy.ndimage.gaussian_laplace operator-for-operator.
+    #
+    # This replaces a hand-written shim, laplace(gaussian_filter(image, sigma)),
+    # added here on the stated grounds that cupyx exposes no gaussian_laplace.
+    # It does. The shim is a different discrete operator -- an approximate
+    # 5-point Laplacian of a smoothed image rather than an analytic
+    # Laplacian-of-Gaussian -- and at the production lap_sigma of 1.0 it
+    # deviates from the fused operator by 16.6% (max, relative), with
+    # correlation 0.9937 and 0.77x the response variance. Since the focus score
+    # is a variance-like reduction of this response, GPU tiles were graded
+    # systematically lower than CPU tiles, and the GPU-OOM fallback at
+    # compute_all_focus_maps switched operators part-way through a sample.
+    from cupyx.scipy.ndimage import (
+        gaussian_laplace as cupy_gaussian_laplace,  # type: ignore[import-untyped]
+    )
     from cupyx.scipy.ndimage import laplace as cupy_laplace  # type: ignore[import-untyped]
-    from cupyx.scipy.ndimage import uniform_filter as cupy_uniform_filter  # type: ignore[import-untyped]
-
-    def cupy_gaussian_laplace(image, sigma):  # type: ignore[misc]
-        """CuPy Laplacian of Gaussian: Gaussian smooth then Laplacian."""
-        from cupyx.scipy.ndimage import gaussian_filter as _gf  # type: ignore[import-untyped]
-
-        return cupy_laplace(_gf(image, sigma=sigma))
+    from cupyx.scipy.ndimage import (
+        uniform_filter as cupy_uniform_filter,  # type: ignore[import-untyped]
+    )
 
     HAS_CUPY = True
 # Broad guard is deliberate: cupy-cuda12x is installed in the container, so a
@@ -78,137 +90,17 @@ try:
 except Exception:
     HAS_CUPY = False
 
-# ---------------------------------------------------------------------------
-# Segmentation-software label helpers, vendored VERBATIM from upstream
-# xenium_helpers.utils (bin/xenium_helpers/src/xenium_helpers/utils.py at
-# nf-xenium-processing dev HEAD 5e35cae). This pipeline does not ship the
-# xenium_helpers package, so the transitive closure needed by image_qc.py is
-# inlined here to keep the script self-contained.
-# Re-sync note: if upstream xenium_helpers.utils changes any of these symbols,
-# re-copy this whole block verbatim rather than hand-patching it.
-# ---------------------------------------------------------------------------
-
-# Display names for pipeline resegmentation tools (raw params.segmentation
-# value -> human-readable). Used as the name-only fallback when no parsed tool
-# version is available.
-SEGMENTATION_PRETTY = {
-    "cellpose": "Cellpose",
-    "cellpose_baysor": "Cellpose + Baysor",
-    "proseg": "Proseg",
-    "segger": "Segger",
-}
-
-# Per-method component tools as (display name, versions.yml key) pairs. The key
-# is the tool name as it appears inside the segmentation modules' versions.yml
-# (e.g. ``cellpose: 3.0.6``). Order defines how multi-tool labels read.
-SEGMENTATION_TOOL_KEYS = {
-    "cellpose": [("Cellpose", "cellpose")],
-    "cellpose_baysor": [("Cellpose", "cellpose"), ("Baysor", "baysor")],
-    "proseg": [("Proseg", "proseg")],
-    "segger": [("Segger", "segger")],
-}
-
-
-def _tool_label(display: str, key: str, tool_versions: Optional[Dict[str, str]]) -> str:
-    """``"Cellpose"`` + version -> ``"Cellpose v3.0.6"`` (name only if absent)."""
-    version = (tool_versions or {}).get(key)
-    return f"{display} v{version}" if version else display
-
-
-def read_xenium_analysis_sw_version(bundle_dir) -> Optional[str]:
-    """Read ``analysis_sw_version`` from ``experiment.xenium`` (e.g.
-    ``"xenium-4.0.1.0"``). Returns ``None`` on missing file, missing key, or
-    malformed JSON. Mirrors ``read_xenium_pixel_size_um`` in bin/snr_metrics.py.
-    """
-    exp = Path(bundle_dir) / "experiment.xenium"
-    if not exp.is_file():
-        return None
-    try:
-        with open(exp, encoding="utf-8") as f:
-            meta = json.load(f)
-        version = meta.get("analysis_sw_version")
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
-        return None
-    if not version or not isinstance(version, str):
-        return None
-    return version
-
-
-def _parse_xenium_version(analysis_sw_version: Optional[str]) -> Optional[str]:
-    """``"xenium-4.0.1.0"`` -> ``"4.0.1"`` (major.minor.patch). Returns ``None``
-    if no leading numeric components can be parsed."""
-    if not analysis_sw_version:
-        return None
-    tail = analysis_sw_version.split("-", 1)[-1]  # drop a 'xenium-' style prefix
-    nums = []
-    for part in tail.split("."):
-        if part.isdigit():
-            nums.append(part)
-        else:
-            break
-    if not nums:
-        return None
-    return ".".join(nums[:3])
-
-
-def read_xenium_major_version(bundle_dir) -> Optional[int]:
-    """Major XOA version for a bundle, read from ``experiment.xenium``
-    (``"xenium-4.0.1.0"`` -> ``4``). Returns ``None`` when the file is absent or
-    the version cannot be parsed. Used to pick XOA-version-specific QC floors
-    (e.g. intensity gates differ sharply between XOA 3.x and 4.0)."""
-    parsed = _parse_xenium_version(read_xenium_analysis_sw_version(bundle_dir))
-    if not parsed:
-        return None
-    first = parsed.split(".", 1)[0]
-    return int(first) if first.isdigit() else None
-
-
-def resolve_segmentation_software(
-    bundle_dir,
-    pipeline_segmentation: str = "skip",
-    is_resegmented: bool = False,
-    tool_versions: Optional[Dict[str, str]] = None,
-) -> str:
-    """Human-readable label for the segmentation software that produced the
-    bundle a QC report describes.
-
-    - Un-resegmented / pre-seg / ``skip``: the onboard analysis version from the
-      bundle's ``experiment.xenium`` -> ``"Xenium Onboard Analysis v4.0.1"``.
-    - Pipeline ``xr`` resegmentation: the reseg bundle's own
-      ``analysis_sw_version`` -> ``"Xenium Ranger v4.0.1 (resegmentation)"``.
-    - Other pipeline tools (cellpose / cellpose_baysor / proseg / segger): the
-      tool name plus its version from ``tool_versions`` (parsed from the
-      segmentation ``versions.yml``), e.g. ``"Cellpose v3.0.6"`` or
-      ``"Cellpose v3.0.6 + Baysor v0.6.2"``. Falls back to name-only when the
-      version is unavailable. Their reseg bundle is packaged via ``xeniumranger
-      import-segmentation``, so its ``experiment.xenium`` would mislabel them as
-      Xenium Ranger; the pipeline tool name is authoritative here.
-    """
-    seg = (pipeline_segmentation or "skip").strip()
-    parsed = _parse_xenium_version(read_xenium_analysis_sw_version(bundle_dir))
-
-    if not is_resegmented or seg == "skip":
-        if parsed:
-            return f"Xenium Onboard Analysis v{parsed}"
-        return "Xenium Onboard Analysis (version unknown)"
-
-    if seg == "xr":
-        if parsed:
-            return f"Xenium Ranger v{parsed} (resegmentation)"
-        return "Xenium Ranger (resegmentation)"
-
-    components = SEGMENTATION_TOOL_KEYS.get(seg)
-    if components:
-        return " + ".join(
-            _tool_label(display, key, tool_versions) for display, key in components
-        )
-    return SEGMENTATION_PRETTY.get(seg, seg)
-
-
-# --------------------------- end vendored block ----------------------------
-
-# Xenium pixel size in micrometers (used for coordinate conversions)
-XENIUM_PIXEL_SIZE_UM = 0.2125
+# Segmentation-software labels and Xenium bundle metadata readers live in
+# spatialqc.bundle, the single copy shared by the image and transcript
+# analyses. Both scripts previously carried byte-identical vendored copies of
+# this block under a "re-sync by re-copying, do NOT hand-patch" banner; the
+# copies were verified identical by diff before being replaced with this import.
+from spatialqc.bundle import (  # noqa: E402
+    XENIUM_PIXEL_SIZE_UM,
+    read_xenium_analysis_sw_version,
+    read_xenium_major_version,
+    resolve_segmentation_software,
+)
 
 # Default CCFS threshold for classifying cells as low nuclear texture quality.
 # CCFS measures per-cell nuclear contrast (local_var/local_mean), NOT optical blur.
@@ -333,9 +225,7 @@ def detect_cluster_outliers(cluster_stats, pct_key):
         (downstream report consumers read ``n_cells`` and the percentage).
     """
     eligible = {
-        cl: s
-        for cl, s in cluster_stats.items()
-        if s.get("n_cells", 0) >= CLUSTER_OUTLIER_MIN_CELLS
+        cl: s for cl, s in cluster_stats.items() if s.get("n_cells", 0) >= CLUSTER_OUTLIER_MIN_CELLS
     }
     if len(eligible) < CLUSTER_OUTLIER_MIN_CLUSTERS:
         return {}
@@ -369,17 +259,13 @@ def _run_figure_task(fn):
 def open_zarr(path: Path, zarr3: bool = False) -> zarr.Group:
     if zarr3:
         store = (
-            zarr.storage.ZipStore(path)
-            if path.suffix == ".zip"
-            else zarr.storage.LocalStore(path)
+            zarr.storage.ZipStore(path) if path.suffix == ".zip" else zarr.storage.LocalStore(path)
         )
         return zarr.open_group(store=store, mode="r")
     else:
         """Open a Zarr file (compatible with zarr < 3)"""
         store = (
-            zarr.ZipStore(path, mode="r")
-            if path.suffix == ".zip"
-            else zarr.DirectoryStore(path)
+            zarr.ZipStore(path, mode="r") if path.suffix == ".zip" else zarr.DirectoryStore(path)
         )
         return zarr.group(store=store)
 
@@ -403,11 +289,7 @@ def load_and_prepare_data(xenium_bundle_dir, outdir):
         / "clusters.csv"
     )
     umap_path = (
-        xenium_bundle_dir
-        / "analysis"
-        / "umap"
-        / "gene_expression_2_components"
-        / "projection.csv"
+        xenium_bundle_dir / "analysis" / "umap" / "gene_expression_2_components" / "projection.csv"
     )
     cell_masks_path = xenium_bundle_dir / "cells.zarr.zip"
     morphology_focus_dir = xenium_bundle_dir / "morphology_focus"
@@ -462,9 +344,7 @@ def _load_morphology_channels(
         r = arr[2].copy() if arr.shape[0] > 2 else None
         return d, b, r
 
-    primary = tifffile.imread(
-        xoa_morphology_files[0], is_ome=False, level=level, aszarr=False
-    )
+    primary = tifffile.imread(xoa_morphology_files[0], is_ome=False, level=level, aszarr=False)
 
     if primary.ndim == 3:
         dapi, boundary, intrna = _split_channels(primary)
@@ -476,9 +356,7 @@ def _load_morphology_channels(
 
     if len(xoa_morphology_files) > 1 and Path(xoa_morphology_files[1]).exists():
         try:
-            b = tifffile.imread(
-                xoa_morphology_files[1], is_ome=False, level=level, aszarr=False
-            )
+            b = tifffile.imread(xoa_morphology_files[1], is_ome=False, level=level, aszarr=False)
             boundary = _split_channels(b)[0] if getattr(b, "ndim", 0) == 3 else b
         except Exception as e:
             logging.warning(
@@ -489,9 +367,7 @@ def _load_morphology_channels(
             boundary = None
     if len(xoa_morphology_files) > 2 and Path(xoa_morphology_files[2]).exists():
         try:
-            r = tifffile.imread(
-                xoa_morphology_files[2], is_ome=False, level=level, aszarr=False
-            )
+            r = tifffile.imread(xoa_morphology_files[2], is_ome=False, level=level, aszarr=False)
             intrna = _split_channels(r)[0] if getattr(r, "ndim", 0) == 3 else r
         except Exception as e:
             logging.warning(
@@ -541,11 +417,7 @@ def otsu_tissue_threshold_with_guard(small0):
     if bg_vals.size == 0 or fg_vals.size == 0:
         return t, False
     bg_std = float(bg_vals.std())
-    sep_sd = (
-        (float(fg_vals.mean()) - float(bg_vals.mean())) / bg_std
-        if bg_std > 1e-9
-        else np.inf
-    )
+    sep_sd = (float(fg_vals.mean()) - float(bg_vals.mean())) / bg_std if bg_std > 1e-9 else np.inf
     ok = (
         TISSUE_OTSU_GUARD_MIN_FG <= fg_frac <= TISSUE_OTSU_GUARD_MAX_FG
         and sep_sd >= TISSUE_OTSU_GUARD_MIN_SEP_SD
@@ -621,11 +493,7 @@ def hysteresis_tissue_mask_with_guard(small0):
         return mask, low, False
     fg_frac = float(np.mean(mask))
     bg_std = float(bg_vals.std())
-    sep_sd = (
-        (float(fg_vals.mean()) - float(bg_vals.mean())) / bg_std
-        if bg_std > 1e-9
-        else np.inf
-    )
+    sep_sd = (float(fg_vals.mean()) - float(bg_vals.mean())) / bg_std if bg_std > 1e-9 else np.inf
     ok = (
         TISSUE_OTSU_GUARD_MIN_FG <= fg_frac <= TISSUE_OTSU_GUARD_MAX_FG
         and sep_sd >= TISSUE_OTSU_GUARD_MIN_SEP_SD
@@ -794,15 +662,20 @@ def generate_tissue_mask(
         - multistain_distance_map / multistain_distance_map2: edge / hole distance maps for
           the multi-stain mask (None on DAPI-only bundles)
     """
+    # Imported here rather than at module scope: this package pulls napari's
+    # SimpleITK plugin, whose vispy import chain dlopens libGLESv2. A module-level
+    # import would make `import spatialqc.image.qc` -- and therefore
+    # `spatialqc-image-qc --help` -- fail or crash on a headless host that has no
+    # GL runtime, even though nothing is ever rendered.
+    import napari_simpleitk_image_processing as nsitk
+
     # Tissue mask via the shared helper (hysteresis + degeneracy guard + `> 0`).
     # 2026-06-23 bug fix: the old `np.percentile(small0, threshold_percentile)`
     # (60) assumed ~40% of the field is tissue and degenerated on sparse/dim
     # slides, and `test_mask > 1` emptied the mask on a single whole-field blob.
     # `threshold_percentile` is retained in the signature but no longer used.
     # See compute_tissue_mask and plans/2026-06-23_PLAN_fix-tissue-mask-bug.md.
-    whole_sample, objects, holes = compute_tissue_mask(
-        small0, min_size_hole=min_size_hole
-    )
+    whole_sample, objects, holes = compute_tissue_mask(small0, min_size_hole=min_size_hole)
 
     # Edge + distance maps (generate_tissue_mask-specific; reuse `objects`/`holes`).
     mask = morphology.remove_small_objects(objects, min_size=min_size_edge)
@@ -888,8 +761,7 @@ def _get_backend(
     if use_gpu:
         if not HAS_CUPY:
             raise RuntimeError(
-                "use_gpu=True but CuPy is not installed. "
-                "Install CuPy or set use_gpu=False."
+                "use_gpu=True but CuPy is not installed. Install CuPy or set use_gpu=False."
             )
         return cp, cupy_uniform_filter, cupy_laplace
     return np, scipy_uniform_filter, scipy_laplace
@@ -1066,8 +938,7 @@ def detect_gpu_ids() -> list[int]:
         # it: otherwise this is indistinguishable from "no GPU present" and a
         # silent CPU fallback on a GPU node looks like correct behaviour.
         logging.warning(
-            "CuPy is installed but GPU detection failed (%s: %s); "
-            "falling back to CPU backend.",
+            "CuPy is installed but GPU detection failed (%s: %s); falling back to CPU backend.",
             type(exc).__name__,
             exc,
         )
@@ -1077,6 +948,56 @@ def detect_gpu_ids() -> list[int]:
 # ---------------------------------------------------------------------------
 # Focus-map computation
 # ---------------------------------------------------------------------------
+
+
+def resolve_available_gpus(device: str, max_gpus: int | None = None) -> list[int]:
+    """Decide which CUDA devices this run may use.
+
+    Resolves the ``device`` selector once, so the rest of the analysis only has
+    to look at the returned list. An empty list means the CPU path.
+
+    Args:
+        device: ``"cpu"`` forces the CPU path even where a GPU is visible;
+            ``"gpu"`` requires at least one usable device; ``"auto"`` uses
+            whatever is present.
+        max_gpus: Cap on the number of devices returned. Needed because
+            Nextflow's ``accelerator`` directive only sizes the AWS Batch
+            request -- it does not restrict CUDA visibility -- so a task that
+            asked for one GPU but landed on a four-GPU instance would otherwise
+            use all four. ``0`` and ``None`` mean "no cap".
+
+    Returns:
+        Device IDs the run may use, capped.
+
+    Raises:
+        RuntimeError: If *device* is ``"gpu"`` but no usable CUDA device exists.
+            Deliberate: a silent CPU fallback yields a correct-looking result at
+            roughly 50x the cost, on a node requested precisely for its GPU.
+        ValueError: If *device* is not one of the three accepted selectors.
+    """
+    if device not in ("auto", "cpu", "gpu"):
+        raise ValueError(f"device must be one of 'auto', 'cpu', 'gpu'; got {device!r}")
+
+    if device == "cpu":
+        logging.info("device=cpu: using the CPU backend")
+        return []
+
+    available_gpus = detect_gpu_ids()
+    if device == "gpu" and not available_gpus:
+        raise RuntimeError(
+            "device='gpu' was requested but no usable CUDA device was found. "
+            "Check that the task actually received a GPU, or pass device='cpu'."
+        )
+
+    if available_gpus and max_gpus and len(available_gpus) > max_gpus:
+        logging.info(
+            f"Detected {len(available_gpus)} GPU(s) {available_gpus} but --max-gpus "
+            f"={max_gpus}; using {available_gpus[:max_gpus]}. The accelerator "
+            "directive sizes the Batch request only, it does not limit CUDA "
+            "visibility."
+        )
+        available_gpus = available_gpus[:max_gpus]
+    return available_gpus
 
 
 def compute_ccfs_map(
@@ -1125,13 +1046,11 @@ def compute_ccfs_map(
             local_mean = uniform_filter(image_f, size=window_size)
             local_sq_mean = uniform_filter(image_f**2, size=window_size)
             # Promote to float64 for subtraction to avoid catastrophic cancellation
-            local_var = (
-                local_sq_mean.astype(cp.float64) - local_mean.astype(cp.float64) ** 2
-            )
+            local_var = local_sq_mean.astype(cp.float64) - local_mean.astype(cp.float64) ** 2
             local_var = xp.maximum(local_var, 0.0)
-            focus_map_dev = (
-                local_var / (local_mean.astype(cp.float64) + _EPSILON)
-            ).astype(cp.float32)
+            focus_map_dev = (local_var / (local_mean.astype(cp.float64) + _EPSILON)).astype(
+                cp.float32
+            )
             focus_map = _to_numpy(focus_map_dev, xp)
             mean_map = _to_numpy(local_mean, xp)
     else:
@@ -1293,9 +1212,7 @@ def _compute_channel_maps_on_gpu(
         ``mean_map_device`` / ``focus_map_device`` (CuPy arrays on *gpu_id*).
     """
     if not HAS_CUPY:
-        raise RuntimeError(
-            "_compute_channel_maps_on_gpu requires CuPy but it is not installed."
-        )
+        raise RuntimeError("_compute_channel_maps_on_gpu requires CuPy but it is not installed.")
 
     pool = cp.get_default_memory_pool()
 
@@ -1313,14 +1230,10 @@ def _compute_channel_maps_on_gpu(
         local_sq_mean = cupy_uniform_filter(sq, size=window_size)
         del sq
         # Promote to float64 for subtraction to avoid catastrophic cancellation
-        local_var = (
-            local_sq_mean.astype(cp.float64) - local_mean.astype(cp.float64) ** 2
-        )
+        local_var = local_sq_mean.astype(cp.float64) - local_mean.astype(cp.float64) ** 2
         del local_sq_mean
         cp.maximum(local_var, 0.0, out=local_var)
-        focus_map_dev = (local_var / (local_mean.astype(cp.float64) + _EPSILON)).astype(
-            cp.float32
-        )
+        focus_map_dev = (local_var / (local_mean.astype(cp.float64) + _EPSILON)).astype(cp.float32)
         del local_var
 
         # Transfer CCFS results to CPU. The host focus map is always produced --
@@ -1529,9 +1442,7 @@ class _LazyTiffChannel:
                     data = fh.read(bytecount)
                     read_s += time.perf_counter() - _t_io
                     read_bytes += bytecount
-                    blobs.append(
-                        (index, (ti - tile_y0) * th, (tj - tile_x0) * tw, data)
-                    )
+                    blobs.append((index, (ti - tile_y0) * th, (tj - tile_x0) * tw, data))
             self._read_seconds += read_s
             self._read_bytes += read_bytes
             # Warm tifffile's (possibly lazily-initialised) decoder ONCE, single-
@@ -1572,9 +1483,7 @@ class _LazyTiffChannel:
     # fallback path — cache full page (non-tiled / test images)
     # ------------------------------------------------------------------
 
-    def _read_region_fallback(
-        self, y0: int, x0: int, height: int, width: int
-    ) -> NDArray:
+    def _read_region_fallback(self, y0: int, x0: int, height: int, width: int) -> NDArray:
         with self._lock:
             if self._cached_data is None:
                 self._cached_data = self._page.asarray()
@@ -1636,12 +1545,8 @@ def _open_morphology_lazy(
 
         dapi = _LazyTiffChannel(pages[0], source=_page_source(0))
         shape = dapi.shape
-        boundary = (
-            _LazyTiffChannel(pages[1], source=_page_source(1)) if n_pages > 1 else None
-        )
-        intrna = (
-            _LazyTiffChannel(pages[2], source=_page_source(2)) if n_pages > 2 else None
-        )
+        boundary = _LazyTiffChannel(pages[1], source=_page_source(1)) if n_pages > 1 else None
+        intrna = _LazyTiffChannel(pages[2], source=_page_source(2)) if n_pages > 2 else None
         # Attach TiffFile handles to prevent garbage collection
         dapi._tiff_handles = tiff_handles  # type: ignore[attr-defined]
         return [dapi, boundary, intrna], shape
@@ -1693,9 +1598,7 @@ def _open_morphology_lazy(
         return [dapi, boundary_ch, intrna_ch], shape
 
     # Truly single-channel 2-D page
-    dapi = _LazyTiffChannel(
-        page0, source=(str(xoa_morphology_files[0]), 0) if level == 0 else None
-    )
+    dapi = _LazyTiffChannel(page0, source=(str(xoa_morphology_files[0]), 0) if level == 0 else None)
     shape = dapi.shape
     boundary = None
     intrna = None
@@ -1709,9 +1612,7 @@ def _open_morphology_lazy(
                 source=(str(xoa_morphology_files[1]), 0) if level == 0 else None,
             )
         except Exception as e:
-            logging.warning(
-                "Boundary TIFF open failed for %s: %s", xoa_morphology_files[1], e
-            )
+            logging.warning("Boundary TIFF open failed for %s: %s", xoa_morphology_files[1], e)
 
     if len(xoa_morphology_files) > 2 and Path(xoa_morphology_files[2]).exists():
         try:
@@ -1722,9 +1623,7 @@ def _open_morphology_lazy(
                 source=(str(xoa_morphology_files[2]), 0) if level == 0 else None,
             )
         except Exception as e:
-            logging.warning(
-                "IntRNA TIFF open failed for %s: %s", xoa_morphology_files[2], e
-            )
+            logging.warning("IntRNA TIFF open failed for %s: %s", xoa_morphology_files[2], e)
 
     # Attach TiffFile handles to prevent garbage collection
     dapi._tiff_handles = tiff_handles  # type: ignore[attr-defined]
@@ -2123,9 +2022,7 @@ def _log_mem_summary() -> None:
     tree = _MEM_PEAK.get("tree_rss", 0.0)
     cgroup_peak = _cgroup_peak()
     parts = [
-        f"cgroup_peak={cgroup_peak / _GIB:.1f}GB"
-        if cgroup_peak is not None
-        else "cgroup_peak=n/a",
+        f"cgroup_peak={cgroup_peak / _GIB:.1f}GB" if cgroup_peak is not None else "cgroup_peak=n/a",
         f"tree_rss={tree / _GIB:.1f}GB",
         f"working_set={_MEM_PEAK['working_set'] / _GIB:.1f}GB",
         f"main_process_rss={_MEM_PEAK['rss'] / _GIB:.1f}GB",
@@ -2298,9 +2195,7 @@ def _run_figure_pool(tasks, *, phase: str = "") -> None:
         # Match the pre-pool barrier: log loudly, do not abort the step. The child
         # already logged the Python traceback via _run_figure_task; this covers
         # non-zero exits (hard crash / OOM-kill) the old p.join() ignored silently.
-        logging.error(
-            f"[FIGPOOL] {phase or 'figures'}: figure task(s) failed: {detail}"
-        )
+        logging.error(f"[FIGPOOL] {phase or 'figures'}: figure task(s) failed: {detail}")
 
 
 # ---------------------------------------------------------------------------
@@ -2417,7 +2312,7 @@ class CentrePixelSampler:
             )
         return dict(self.values)
 
-    def spawn(self) -> "CentrePixelSampler":
+    def spawn(self) -> CentrePixelSampler:
         """A fresh, empty sampler sharing this one's ROI grid and keys.
 
         Used by the tile pass to give each worker thread its own accumulator so
@@ -2425,7 +2320,7 @@ class CentrePixelSampler:
         """
         return CentrePixelSampler(self.cy, self.cx, list(self.values))
 
-    def merge(self, other: "CentrePixelSampler") -> None:
+    def merge(self, other: CentrePixelSampler) -> None:
         """Fold a per-worker partial into this one.
 
         Each ROI is claimed by exactly one tile, hence by exactly one worker, so the
@@ -2475,18 +2370,13 @@ class LazyLabelPlane:
         if (
             isinstance(key, tuple)
             and len(key) == 2
-            and all(
-                isinstance(part, (np.ndarray, list)) or np.isscalar(part)
-                for part in key
-            )
+            and all(isinstance(part, (np.ndarray, list)) or np.isscalar(part) for part in key)
             and not any(isinstance(part, slice) for part in key)
         ):
             return self._gather(np.asarray(key[0]), np.asarray(key[1]))
         return np.asarray(self._source[key])
 
-    def _gather(
-        self, rows: NDArray[np.integer], cols: NDArray[np.integer]
-    ) -> NDArray[Any]:
+    def _gather(self, rows: NDArray[np.integer], cols: NDArray[np.integer]) -> NDArray[Any]:
         """Point lookup, reading only the row blocks the points land in."""
         rows = np.asarray(rows, dtype=np.int64).ravel()
         cols = np.asarray(cols, dtype=np.int64).ravel()
@@ -2604,9 +2494,7 @@ class LabeledSumAccumulator:
         # tile actually handed over. A value-less counts-only accumulator (cells) has no
         # value map to check, so fall back to any resident device array in the tile.
         value_maps = {
-            key: _device_or_host(maps, key)
-            for key in self.sums
-            if not key.startswith("centroid_")
+            key: _device_or_host(maps, key) for key in self.sums if not key.startswith("centroid_")
         }
         device_arr = next((a for a in value_maps.values() if _is_device_array(a)), None)
         if device_arr is None:
@@ -2674,9 +2562,7 @@ class LabeledSumAccumulator:
             for key, array in value_maps.items():
                 if array is None:
                     continue
-                values = xp.asarray(
-                    array[y0 - wy0 : y1 - wy0], dtype=xp.float64
-                ).ravel()
+                values = xp.asarray(array[y0 - wy0 : y1 - wy0], dtype=xp.float64).ravel()
                 if selected is not None:
                     values = values[selected]
                 self._add(key, _host(xp.bincount(labels, weights=values, minlength=n)))
@@ -2707,7 +2593,7 @@ class LabeledSumAccumulator:
         """Return ``(counts, sums)`` indexed by raw label value, 0 = background."""
         return self.counts, dict(self.sums)
 
-    def spawn(self) -> "LabeledSumAccumulator":
+    def spawn(self) -> LabeledSumAccumulator:
         """A fresh, empty accumulator sharing this one's label plane and keys.
 
         Used by the tile pass to give each worker thread its own accumulator so
@@ -2722,7 +2608,7 @@ class LabeledSumAccumulator:
             skip_background=self.skip_background,
         )
 
-    def merge(self, other: "LabeledSumAccumulator") -> None:
+    def merge(self, other: LabeledSumAccumulator) -> None:
         """Fold a per-worker partial into this one by element-wise addition.
 
         Counts and per-label float64 sums are additive, so adding a worker's
@@ -2766,15 +2652,11 @@ def _block_sum(
     """
     values = np.asarray(array, dtype=np.float64)
     rows = np.arange(values.shape[0]) + y_offset
-    row_starts = np.flatnonzero(
-        np.r_[True, (rows[1:] // factor) != (rows[:-1] // factor)]
-    )
+    row_starts = np.flatnonzero(np.r_[True, (rows[1:] // factor) != (rows[:-1] // factor)])
     partial = np.add.reduceat(values, row_starts, axis=0)
 
     cols = np.arange(values.shape[1]) + x_offset
-    col_starts = np.flatnonzero(
-        np.r_[True, (cols[1:] // factor) != (cols[:-1] // factor)]
-    )
+    col_starts = np.flatnonzero(np.r_[True, (cols[1:] // factor) != (cols[:-1] // factor)])
     block = np.add.reduceat(partial, col_starts, axis=1)
     return block, rows[row_starts] // factor, cols[col_starts] // factor
 
@@ -2910,9 +2792,7 @@ class BlockMeanAccumulator:
         pad_x = (-values.shape[1]) % f
         if pad_y or pad_x:
             values = np.pad(values, ((0, pad_y), (0, pad_x)), mode="constant")
-        blocks = values.reshape(values.shape[0] // f, f, values.shape[1] // f, f).sum(
-            axis=(1, 3)
-        )
+        blocks = values.reshape(values.shape[0] // f, f, values.shape[1] // f, f).sum(axis=(1, 3))
         r0, c0 = wy0 // f, wx0 // f
         self.sums[r0 : r0 + blocks.shape[0], c0 : c0 + blocks.shape[1]] += blocks
 
@@ -2926,17 +2806,15 @@ class BlockMeanAccumulator:
             means = means.astype(self._out_dtype)
         return means
 
-    def spawn(self) -> "BlockMeanAccumulator":
+    def spawn(self) -> BlockMeanAccumulator:
         """A fresh, empty canvas of the same shape / factor / map key.
 
         Used by the tile pass to give each worker thread its own accumulator so
         folds run without a lock; the partials are then reduced with ``merge``.
         """
-        return BlockMeanAccumulator(
-            self.shape, factor=self.factor, map_key=self.map_key
-        )
+        return BlockMeanAccumulator(self.shape, factor=self.factor, map_key=self.map_key)
 
-    def merge(self, other: "BlockMeanAccumulator") -> None:
+    def merge(self, other: BlockMeanAccumulator) -> None:
         """Fold a per-worker partial canvas into this one.
 
         Write origins are aligned to ``factor`` (the dispatcher enforces it via
@@ -3083,9 +2961,7 @@ class RoiOtsuSnrAccumulator:
         valid = (y_stop > y_start) & (x_stop > x_start)
         # The read region must cover every non-empty window, or a window would be
         # silently truncated and its dB wrong. Raise, as the per-ROI path did.
-        covered = (
-            (ry0 <= y_start) & (y_stop <= ry1) & (rx0 <= x_start) & (x_stop <= rx1)
-        )
+        covered = (ry0 <= y_start) & (y_stop <= ry1) & (rx0 <= x_start) & (x_stop <= rx1)
         bad = np.flatnonzero(valid & ~covered)
         if bad.size:
             b = int(bad[0])
@@ -3103,11 +2979,7 @@ class RoiOtsuSnrAccumulator:
         x1r = (x_stop - rx0).astype(np.int64)
         # Full-size interior windows share one shape and are batched together;
         # partial (edge-clipped) windows keep the scalar path.
-        full = (
-            valid
-            & (y_stop - y_start == self._full_h)
-            & (x_stop - x_start == self._full_w)
-        )
+        full = valid & (y_stop - y_start == self._full_h) & (x_stop - x_start == self._full_w)
 
         def _scalar(positions: NDArray[np.integer]) -> None:
             for pos in positions:
@@ -3166,7 +3038,7 @@ class RoiOtsuSnrAccumulator:
             )
         return self.db
 
-    def spawn(self) -> "RoiOtsuSnrAccumulator":
+    def spawn(self) -> RoiOtsuSnrAccumulator:
         """A fresh, empty accumulator sharing this one's ROI geometry.
 
         Used by the tile pass to give each worker thread its own accumulator so
@@ -3181,7 +3053,7 @@ class RoiOtsuSnrAccumulator:
             map_key=self.map_key,
         )
 
-    def merge(self, other: "RoiOtsuSnrAccumulator") -> None:
+    def merge(self, other: RoiOtsuSnrAccumulator) -> None:
         """Fold a per-worker partial into this one.
 
         An ROI is owned by the single tile whose write region holds its top-left
@@ -3274,9 +3146,7 @@ class _PlaneStore:
         for key in self.keys:
             if self._dir is not None:
                 path = self._dir / f"{prefix}_{key}.dat"
-                self._arrays[key] = np.memmap(
-                    path, dtype=self.dtype, mode="w+", shape=self.shape
-                )
+                self._arrays[key] = np.memmap(path, dtype=self.dtype, mode="w+", shape=self.shape)
                 self.paths[key] = str(path)
             else:
                 self._arrays[key] = np.empty(self.shape, dtype=self.dtype)
@@ -3451,9 +3321,7 @@ def _process_tile_on_gpu(
     )
 
     # Compute on GPU using existing function
-    result = _compute_channel_maps_on_gpu(
-        tile, window_size, gpu_id, include_laplacian, lap_sigma
-    )
+    result = _compute_channel_maps_on_gpu(tile, window_size, gpu_id, include_laplacian, lap_sigma)
     del tile
 
     # Trim overlap and write each output straight into the caller's plane
@@ -3643,9 +3511,7 @@ def _compute_channel_maps_tiled(
         # max(), not a conditional skip: a strip shorter than one block would otherwise
         # be left unaligned and trip the accumulator's contract check at runtime. Rounding
         # up to one block costs at most align_writes_to rows of halo.
-        strip_height = max(
-            align_writes_to, (strip_height // align_writes_to) * align_writes_to
-        )
+        strip_height = max(align_writes_to, (strip_height // align_writes_to) * align_writes_to)
     tiles = _compute_tile_grid(H, W, strip_height, overlap, tile_width=W)
 
     logging.info(
@@ -3746,12 +3612,8 @@ def _compute_channel_maps_tiled(
         # host focus map is always produced: BlockMeanAccumulator (Figure 5) reduces
         # it in float32 on the host, which a GPU reduction cannot match to float
         # rounding, so it never sets wants_device_focus.
-        keep_mean_device = any(
-            getattr(c, "wants_device_mean", False) for c in consumers
-        )
-        keep_focus_device = any(
-            getattr(c, "wants_device_focus", False) for c in consumers
-        )
+        keep_mean_device = any(getattr(c, "wants_device_mean", False) for c in consumers)
+        keep_focus_device = any(getattr(c, "wants_device_focus", False) for c in consumers)
         drop_mean_host = keep_mean_device and not any(
             getattr(c, "reads_host_mean", False) for c in consumers
         )
@@ -3789,9 +3651,7 @@ def _compute_channel_maps_tiled(
                     else:
                         consumer.consume(spec, trimmed)
                     name = type(consumer).__name__
-                    local_per[name] = local_per.get(name, 0.0) + (
-                        time.perf_counter() - t_c
-                    )
+                    local_per[name] = local_per.get(name, 0.0) + (time.perf_counter() - t_c)
                 fold = time.perf_counter() - t1
                 # Aggregate the per-consumer fold time across threads (these overlap
                 # in wall clock now, so this is summed CPU, not wall time).
@@ -3882,9 +3742,7 @@ def _compute_channel_maps_tiled(
     # the duration of iteration, so a worker that *returned* its arrays would
     # keep all of them alive until the executor block exited).
     keys = ["focus_map", "mean_map"] + (["lap_var_map"] if include_laplacian else [])
-    store = _PlaneStore(
-        (H, W), keys, plane_dir=plane_dir, prefix=plane_prefix, dtype=np.float32
-    )
+    store = _PlaneStore((H, W), keys, plane_dir=plane_dir, prefix=plane_prefix, dtype=np.float32)
     out_planes: dict[str, Any] = store.arrays()
     out_planes.setdefault("lap_var_map", None)
 
@@ -3894,9 +3752,7 @@ def _compute_channel_maps_tiled(
     # (a live TiffPage holds an OS handle and a lock, so it cannot be pickled),
     # and file-backed planes to write into.  Single-GPU runs keep the thread
     # path, so their behaviour is unchanged.
-    use_processes = (
-        n_gpus > 1 and channel_source is not None and plane_paths is not None
-    )
+    use_processes = n_gpus > 1 and channel_source is not None and plane_paths is not None
     tasks = [(spec, window_size, include_laplacian, lap_sigma) for spec in tiles]
     t_dispatch = time.perf_counter()
 
@@ -3944,9 +3800,7 @@ def _compute_channel_maps_tiled(
             return gpu_id, time.perf_counter() - t0
 
         with ThreadPoolExecutor(max_workers=n_gpus) as executor:
-            futures = [
-                executor.submit(_run_tile, i, spec) for i, spec in enumerate(tiles)
-            ]
+            futures = [executor.submit(_run_tile, i, spec) for i, spec in enumerate(tiles)]
             timings = [f.result() for f in as_completed(futures)]
 
     store.flush()
@@ -4023,8 +3877,7 @@ def compute_all_focus_maps(
         intrna = channels[2].copy() if n_ch > 2 else None
     else:
         raise ValueError(
-            f"Expected 2-D or 3-D array, got {channels.ndim}-D "
-            f"(shape {channels.shape})."
+            f"Expected 2-D or 3-D array, got {channels.ndim}-D (shape {channels.shape})."
         )
     del channels
 
@@ -4049,9 +3902,7 @@ def compute_all_focus_maps(
         t_gpu = time.perf_counter()
         gpu_failed = False
         try:
-            with ThreadPoolExecutor(
-                max_workers=min(len(work_items), n_gpus)
-            ) as executor:
+            with ThreadPoolExecutor(max_workers=min(len(work_items), n_gpus)) as executor:
                 futures = {}
                 for idx, (name, ch_data, inc_lap) in enumerate(work_items):
                     assigned_gpu = gpu_ids[idx % n_gpus]
@@ -4090,20 +3941,14 @@ def compute_all_focus_maps(
                 "boundary_mean_map": results["boundary"]["mean_map"]
                 if "boundary" in results
                 else None,
-                "intrna_focus_map": results["intrna"]["focus_map"]
-                if "intrna" in results
-                else None,
-                "intrna_mean_map": results["intrna"]["mean_map"]
-                if "intrna" in results
-                else None,
+                "intrna_focus_map": results["intrna"]["focus_map"] if "intrna" in results else None,
+                "intrna_mean_map": results["intrna"]["mean_map"] if "intrna" in results else None,
             }
         # else: fall through to CPU path below
 
     # ---- Single-GPU or CPU fallback path ----
     # Reached when: no multi-GPU available, use_gpu=False, or GPU OOM fallback
-    use_gpu = (
-        False  # Force CPU to avoid repeated OOM if we fell through from GPU failure
-    )
+    use_gpu = False  # Force CPU to avoid repeated OOM if we fell through from GPU failure
     gpu_id = gpu_ids[0] if gpu_ids else 0
 
     t_gpu = time.perf_counter()
@@ -4178,9 +4023,7 @@ def _build_roi_grid(
     height, width = image_shape
 
     # Build ROI grid — vectorized
-    x1_arr, x2_arr, y1_arr, y2_arr, cx, cy = compute_roi_grid(
-        height, width, roi_size, stride
-    )
+    x1_arr, x2_arr, y1_arr, y2_arr, cx, cy = compute_roi_grid(height, width, roi_size, stride)
     n_rois = len(x1_arr)
     roi_coords_arr = np.stack([x1_arr, x2_arr, y1_arr, y2_arr], axis=1)
 
@@ -4211,10 +4054,7 @@ def _build_roi_grid(
 
     half_win = roi_size // 2
     is_boundary_roi = (
-        (cx < half_win)
-        | (cy < half_win)
-        | (cx >= width - half_win)
-        | (cy >= height - half_win)
+        (cx < half_win) | (cy < half_win) | (cx >= width - half_win) | (cy >= height - half_win)
     )
 
     return {
@@ -4260,9 +4100,7 @@ def compute_roi_grid(
     """
     if stride is None:
         stride = roi_size
-    yy, xx = np.meshgrid(
-        np.arange(0, height, stride), np.arange(0, width, stride), indexing="ij"
-    )
+    yy, xx = np.meshgrid(np.arange(0, height, stride), np.arange(0, width, stride), indexing="ij")
     x1_all, y1_all = xx.ravel(), yy.ravel()
     x2_all = np.minimum(x1_all + roi_size, width)
     y2_all = np.minimum(y1_all + roi_size, height)
@@ -4272,8 +4110,7 @@ def compute_roi_grid(
     y1_arr, y2_arr = y1_all[valid], y2_all[valid]
     if len(x1_arr) == 0:
         raise ValueError(
-            f"No tiles generated. Image: {height}x{width}, "
-            f"roi_size={roi_size}, stride={stride}."
+            f"No tiles generated. Image: {height}x{width}, roi_size={roi_size}, stride={stride}."
         )
     return (
         x1_arr,
@@ -4440,9 +4277,7 @@ def downsample_maps_to_roi_dataframe(
         block_h = y2_ds - y1_ds
         uniform_w = int(block_w[0]) if len(block_w) > 0 else 0
         uniform_h = int(block_h[0]) if len(block_h) > 0 else 0
-        all_uniform = bool(
-            np.all(block_w == uniform_w) and np.all(block_h == uniform_h)
-        )
+        all_uniform = bool(np.all(block_w == uniform_w) and np.all(block_h == uniform_h))
 
         if all_uniform and uniform_w > 0 and uniform_h > 0:
             # Fast path: use a 2D integral image (summed-area table)
@@ -4475,9 +4310,7 @@ def downsample_maps_to_roi_dataframe(
     else:
         tissue_coverages_arr = np.ones(n_rois, dtype=np.float64)
 
-    logging.info(
-        f"  [TIMING] Tissue coverage computation: {time.perf_counter() - t_tissue:.1f}s"
-    )
+    logging.info(f"  [TIMING] Tissue coverage computation: {time.perf_counter() - t_tissue:.1f}s")
 
     # ------------------------------------------------------------------
     # Sample centre pixel for each ROI — vectorized fancy indexing
@@ -4508,9 +4341,7 @@ def downsample_maps_to_roi_dataframe(
         boundary_intensities = _sampled("boundary_mean_map") if has_boundary else None
         intrna_focus_scores = _sampled("intrna_focus_map") if has_intrna else None
         intrna_intensities = _sampled("intrna_mean_map") if has_intrna else None
-        logging.info(
-            f"  [TIMING] Centre-pixel sampling ({n_rois} tiles): from the tile pass"
-        )
+        logging.info(f"  [TIMING] Centre-pixel sampling ({n_rois} tiles): from the tile pass")
     else:
         # DAPI channels (always present)
         dapi_focus_scores = dapi_focus_map[cy, cx].astype(np.float64)
@@ -4551,43 +4382,32 @@ def downsample_maps_to_roi_dataframe(
     # ------------------------------------------------------------------
     t_scaler = time.perf_counter()
     scaler_dapi = RobustScaler()
-    dapi_focus_scores_norm = scaler_dapi.fit_transform(
-        dapi_focus_scores.reshape(-1, 1)
-    ).flatten()
+    dapi_focus_scores_norm = scaler_dapi.fit_transform(dapi_focus_scores.reshape(-1, 1)).flatten()
 
     if has_boundary:
         scaler_boundary = RobustScaler()
-        boundary_focus_scores_norm: NDArray[np.float64] | None = (
-            scaler_boundary.fit_transform(
-                boundary_focus_scores.reshape(-1, 1)  # type: ignore[union-attr]
-            ).flatten()
-        )
+        boundary_focus_scores_norm: NDArray[np.float64] | None = scaler_boundary.fit_transform(
+            boundary_focus_scores.reshape(-1, 1)  # type: ignore[union-attr]
+        ).flatten()
     else:
         boundary_focus_scores_norm = None
 
     if has_intrna:
         scaler_intrna = RobustScaler()
-        intrna_focus_scores_norm: NDArray[np.float64] | None = (
-            scaler_intrna.fit_transform(
-                intrna_focus_scores.reshape(-1, 1)  # type: ignore[union-attr]
-            ).flatten()
-        )
+        intrna_focus_scores_norm: NDArray[np.float64] | None = scaler_intrna.fit_transform(
+            intrna_focus_scores.reshape(-1, 1)  # type: ignore[union-attr]
+        ).flatten()
     else:
         intrna_focus_scores_norm = None
 
-    logging.info(
-        f"  [TIMING] RobustScaler normalization: {time.perf_counter() - t_scaler:.1f}s"
-    )
+    logging.info(f"  [TIMING] RobustScaler normalization: {time.perf_counter() - t_scaler:.1f}s")
 
     # ------------------------------------------------------------------
     # Mark boundary tiles (centre within roi_size//2 of image edge)
     # ------------------------------------------------------------------
     half_win = roi_size // 2
     is_boundary_roi = (
-        (cx < half_win)
-        | (cy < half_win)
-        | (cx >= width - half_win)
-        | (cy >= height - half_win)
+        (cx < half_win) | (cy < half_win) | (cx >= width - half_win) | (cy >= height - half_win)
     )
 
     # ------------------------------------------------------------------
@@ -4611,9 +4431,7 @@ def downsample_maps_to_roi_dataframe(
         "raw_intensity": dapi_intensities.copy(),  # backward compatibility
         # Boundary channel
         "boundary_focus_score": (boundary_focus_scores if has_boundary else np.nan),
-        "boundary_focus_score_norm": (
-            boundary_focus_scores_norm if has_boundary else np.nan
-        ),
+        "boundary_focus_score_norm": (boundary_focus_scores_norm if has_boundary else np.nan),
         "boundary_intensity": (boundary_intensities if has_boundary else np.nan),
         # IntRNA channel
         "intrna_focus_score": (intrna_focus_scores if has_intrna else np.nan),
@@ -4695,8 +4513,7 @@ def calculate_roi_focusscore_without_laplace(
 
     if has_boundary:
         logging.info(
-            f"  Found {n_channels} channels: DAPI, Boundary"
-            + (", IntRNA" if has_intrna else "")
+            f"  Found {n_channels} channels: DAPI, Boundary" + (", IntRNA" if has_intrna else "")
         )
     else:
         logging.info(f"  Found {n_channels} channel(s): DAPI only")
@@ -4788,9 +4605,7 @@ def calculate_roi_focusscore_without_laplace(
         roi_dapi = dapi_image[y1:y2, x1:x2]
         mean_dapi = np.mean(roi_dapi)
         std_dapi = np.std(roi_dapi)
-        dapi_focus_scores[i] = (
-            (std_dapi * std_dapi) / mean_dapi if mean_dapi > 0 else 0.0
-        )
+        dapi_focus_scores[i] = (std_dapi * std_dapi) / mean_dapi if mean_dapi > 0 else 0.0
         dapi_intensities[i] = mean_dapi
 
         # Boundary channel (if available)
@@ -4799,9 +4614,7 @@ def calculate_roi_focusscore_without_laplace(
             mean_boundary = np.mean(roi_boundary)
             std_boundary = np.std(roi_boundary)
             boundary_focus_scores[i] = (
-                (std_boundary * std_boundary) / mean_boundary
-                if mean_boundary > 0
-                else 0.0
+                (std_boundary * std_boundary) / mean_boundary if mean_boundary > 0 else 0.0
             )
             boundary_intensities[i] = mean_boundary
 
@@ -4825,9 +4638,7 @@ def calculate_roi_focusscore_without_laplace(
         )
 
     scaler_dapi = RobustScaler()
-    dapi_focus_scores_norm = scaler_dapi.fit_transform(
-        dapi_focus_scores.reshape(-1, 1)
-    ).flatten()
+    dapi_focus_scores_norm = scaler_dapi.fit_transform(dapi_focus_scores.reshape(-1, 1)).flatten()
 
     if has_boundary:
         if len(boundary_focus_scores) == 0:
@@ -4843,9 +4654,7 @@ def calculate_roi_focusscore_without_laplace(
 
     if has_intrna:
         if len(intrna_focus_scores) == 0:
-            raise ValueError(
-                "ERROR: Cannot normalize IntRNA focus scores - empty array detected!"
-            )
+            raise ValueError("ERROR: Cannot normalize IntRNA focus scores - empty array detected!")
         scaler_intrna = RobustScaler()
         intrna_focus_scores_norm = scaler_intrna.fit_transform(
             intrna_focus_scores.reshape(-1, 1)
@@ -4870,8 +4679,7 @@ def calculate_roi_focusscore_without_laplace(
         "raw_intensity": dapi_intensities,  # Backward compatibility
         "tissue_coverage": tissue_coverages if tissue_filter else [1.0] * n_rois,
         "overlaps_tissue": [
-            coverage > 0.0
-            for coverage in (tissue_coverages if tissue_filter else [1.0] * n_rois)
+            coverage > 0.0 for coverage in (tissue_coverages if tissue_filter else [1.0] * n_rois)
         ],
     }
 
@@ -4980,9 +4788,7 @@ def _stream_channels(
     zarr per tile, so neither ``masks/0`` nor ``masks/1`` (22 GB each on a 5.5
     gigapixel sample) is materialised.
     """
-    x1, x2, y1, y2, cx, cy = compute_roi_grid(
-        image_shape[0], image_shape[1], roi_size, stride
-    )
+    x1, x2, y1, y2, cx, cy = compute_roi_grid(image_shape[0], image_shape[1], roi_size, stride)
     logging.info(f"  Streaming mode: {len(cx):,} ROIs, no pixel planes materialised")
 
     nuclear_plane = cell_plane = None
@@ -5025,9 +4831,7 @@ def _stream_channels(
                 made["heat"] = BlockMeanAccumulator(
                     image_shape, factor=heatmap_factor, map_key="focus_map"
                 )
-                made["snr"] = RoiOtsuSnrAccumulator(
-                    y1, y2, x1, x2, image_shape, map_key="mean_map"
-                )
+                made["snr"] = RoiOtsuSnrAccumulator(y1, y2, x1, x2, image_shape, map_key="mean_map")
                 ordered += [made["heat"], made["snr"]]
                 if nuclear_plane is not None:
                     made["nuc"] = LabeledSumAccumulator(
@@ -5063,9 +4867,7 @@ def _stream_channels(
             plane_prefix=name,
             consumers=consumers,
         )
-        logging.info(
-            f"  [TIMING] {name} channel streamed: {time.perf_counter() - t_ch:.1f}s"
-        )
+        logging.info(f"  [TIMING] {name} channel streamed: {time.perf_counter() - t_ch:.1f}s")
         _log_mem(f"{name} channel streamed")
 
         # CentrePixelSampler keys are per-channel ("focus_map"); the ROI DataFrame
@@ -5232,9 +5034,7 @@ def calculate_roi_focusscore(
             f"  Found {n_channels} channel(s); computing per-pixel focus maps "
             f"(window={roi_size}, {gpu_label}, tiled)..."
         )
-        logging.info(
-            f"  Image shape: {img_shape[0]}x{img_shape[1]}, {n_channels} channel(s)"
-        )
+        logging.info(f"  Image shape: {img_shape[0]}x{img_shape[1]}, {n_channels} channel(s)")
 
         t_gpu = time.perf_counter()
         gpu_mem = cp.cuda.Device(gpu_ids[0]).mem_info[1]  # total VRAM per device
@@ -5305,20 +5105,15 @@ def calculate_roi_focusscore(
                 plane_prefix="intrna",
             )
         logging.info(
-            f"  [TIMING] GPU compute (tiled, {n_channels} ch): "
-            f"{time.perf_counter() - t_gpu:.1f}s"
+            f"  [TIMING] GPU compute (tiled, {n_channels} ch): {time.perf_counter() - t_gpu:.1f}s"
         )
 
         focus_maps = {
             "dapi_focus_map": dapi_result["focus_map"],
             "dapi_mean_map": dapi_result["mean_map"],
             "dapi_lap_var_map": dapi_result.get("lap_var_map"),
-            "boundary_focus_map": (
-                boundary_result["focus_map"] if boundary_result else None
-            ),
-            "boundary_mean_map": (
-                boundary_result["mean_map"] if boundary_result else None
-            ),
+            "boundary_focus_map": (boundary_result["focus_map"] if boundary_result else None),
+            "boundary_mean_map": (boundary_result["mean_map"] if boundary_result else None),
             "intrna_focus_map": intrna_result["focus_map"] if intrna_result else None,
             "intrna_mean_map": intrna_result["mean_map"] if intrna_result else None,
         }
@@ -5352,9 +5147,7 @@ def calculate_roi_focusscore(
 
     # Build ROI grid once (cheap — just coordinate arrays)
     image_shape = dapi_image.shape[:2]
-    grid = _build_roi_grid(
-        image_shape, roi_size, stride, tissue_mask, downsample_factor
-    )
+    grid = _build_roi_grid(image_shape, roi_size, stride, tissue_mask, downsample_factor)
     cx, cy = grid["cx"], grid["cy"]
     n_rois = grid["n_rois"]
     logging.info(f"  Tile grid: {n_rois:,} tiles")
@@ -5414,9 +5207,7 @@ def calculate_roi_focusscore(
 
     # -- Normalize focus scores with RobustScaler --
     scaler_dapi = RobustScaler()
-    dapi_focus_scores_norm = scaler_dapi.fit_transform(
-        dapi_focus_scores.reshape(-1, 1)
-    ).flatten()
+    dapi_focus_scores_norm = scaler_dapi.fit_transform(dapi_focus_scores.reshape(-1, 1)).flatten()
 
     boundary_focus_scores_norm = None
     if boundary_focus_scores is not None:
@@ -5448,9 +5239,7 @@ def calculate_roi_focusscore(
         "dapi_intensity": dapi_intensities,
         "raw_intensity": dapi_intensities.copy(),
         "boundary_focus_score": boundary_focus_scores if has_boundary else np.nan,
-        "boundary_focus_score_norm": boundary_focus_scores_norm
-        if has_boundary
-        else np.nan,
+        "boundary_focus_score_norm": boundary_focus_scores_norm if has_boundary else np.nan,
         "boundary_intensity": boundary_intensities if has_boundary else np.nan,
         "intrna_focus_score": intrna_focus_scores if has_intrna else np.nan,
         "intrna_focus_score_norm": intrna_focus_scores_norm if has_intrna else np.nan,
@@ -5504,20 +5293,12 @@ def calculate_roi_blur_threshold(
         Threshold value in raw score units
     """
     # Get intensity column (handle both naming conventions)
-    intensity_col = (
-        "dapi_intensity" if "dapi_intensity" in df_grid_roi.columns else "raw_intensity"
-    )
+    intensity_col = "dapi_intensity" if "dapi_intensity" in df_grid_roi.columns else "raw_intensity"
     if intensity_col not in df_grid_roi.columns:
-        raise ValueError(
-            "Intensity column not found. Expected 'dapi_intensity' or 'raw_intensity'"
-        )
+        raise ValueError("Intensity column not found. Expected 'dapi_intensity' or 'raw_intensity'")
 
     # Get focus score column (handle both naming conventions)
-    focus_col = (
-        "dapi_focus_score"
-        if "dapi_focus_score" in df_grid_roi.columns
-        else "focus_score"
-    )
+    focus_col = "dapi_focus_score" if "dapi_focus_score" in df_grid_roi.columns else "focus_score"
     if focus_col not in df_grid_roi.columns:
         raise ValueError(
             "Focus score column not found. Expected 'dapi_focus_score' or 'focus_score'"
@@ -5584,13 +5365,9 @@ def fit_focus_gmm(
         Index of the GMM component corresponding to blurred tiles (lower mean).
     """
     # Determine intensity column
-    intensity_col = (
-        "dapi_intensity" if "dapi_intensity" in df_grid_roi.columns else "raw_intensity"
-    )
+    intensity_col = "dapi_intensity" if "dapi_intensity" in df_grid_roi.columns else "raw_intensity"
     if intensity_col not in df_grid_roi.columns:
-        raise ValueError(
-            "Intensity column not found. Expected 'dapi_intensity' or 'raw_intensity'"
-        )
+        raise ValueError("Intensity column not found. Expected 'dapi_intensity' or 'raw_intensity'")
 
     # Determine focus column
     if focus_col_name not in df_grid_roi.columns:
@@ -5669,13 +5446,9 @@ def classify_roi_blur_by_threshold(
     """
     df = df_grid_roi.copy()
 
-    intensity_col = (
-        "dapi_intensity" if "dapi_intensity" in df.columns else "raw_intensity"
-    )
+    intensity_col = "dapi_intensity" if "dapi_intensity" in df.columns else "raw_intensity"
     if intensity_col not in df.columns:
-        raise ValueError(
-            "Intensity column not found. Expected 'dapi_intensity' or 'raw_intensity'"
-        )
+        raise ValueError("Intensity column not found. Expected 'dapi_intensity' or 'raw_intensity'")
 
     if focus_col_name not in df.columns:
         if "focus_score" not in df.columns:
@@ -5697,12 +5470,8 @@ def classify_roi_blur_by_threshold(
 
     logging.info("  Percentile-threshold fallback blur classification completed")
     logging.info(f"    Total tiles: {total_rois}")
-    logging.info(
-        f"    Low-intensity tiles (auto-blurred): {n_low_int} ({pct_low:.1f}%)"
-    )
-    logging.info(
-        f"    Blurred tiles (threshold + intensity): {n_blur} ({pct_blur:.1f}%)"
-    )
+    logging.info(f"    Low-intensity tiles (auto-blurred): {n_low_int} ({pct_low:.1f}%)")
+    logging.info(f"    Blurred tiles (threshold + intensity): {n_blur} ({pct_blur:.1f}%)")
 
     return df
 
@@ -5761,13 +5530,9 @@ def classify_roi_blur(
     df = df_grid_roi.copy()
 
     # Intensity column
-    intensity_col = (
-        "dapi_intensity" if "dapi_intensity" in df.columns else "raw_intensity"
-    )
+    intensity_col = "dapi_intensity" if "dapi_intensity" in df.columns else "raw_intensity"
     if intensity_col not in df.columns:
-        raise ValueError(
-            "Intensity column not found. Expected 'dapi_intensity' or 'raw_intensity'"
-        )
+        raise ValueError("Intensity column not found. Expected 'dapi_intensity' or 'raw_intensity'")
 
     # Focus column
     if focus_col_name not in df.columns:
@@ -5861,13 +5626,9 @@ def fit_focus_gmm_2d(
         Index of the GMM component corresponding to blurred tiles (lower mean on focus_score dimension).
     """
     # Determine intensity column
-    intensity_col = (
-        "dapi_intensity" if "dapi_intensity" in df_grid_roi.columns else "raw_intensity"
-    )
+    intensity_col = "dapi_intensity" if "dapi_intensity" in df_grid_roi.columns else "raw_intensity"
     if intensity_col not in df_grid_roi.columns:
-        raise ValueError(
-            "Intensity column not found. Expected 'dapi_intensity' or 'raw_intensity'"
-        )
+        raise ValueError("Intensity column not found. Expected 'dapi_intensity' or 'raw_intensity'")
 
     # Determine focus column
     if focus_col_name not in df_grid_roi.columns:
@@ -5898,13 +5659,9 @@ def fit_focus_gmm_2d(
         tissue_rois = df_grid_roi[
             df_grid_roi["tissue_coverage"] >= ROI_MIN_TISSUE_COVERAGE_FOR_INTENSITY_QC
         ].copy()
-        _selection_desc = (
-            f"tissue_coverage >= {ROI_MIN_TISSUE_COVERAGE_FOR_INTENSITY_QC}"
-        )
+        _selection_desc = f"tissue_coverage >= {ROI_MIN_TISSUE_COVERAGE_FOR_INTENSITY_QC}"
     else:
-        tissue_rois = df_grid_roi[
-            df_grid_roi[intensity_col] >= intensity_threshold
-        ].copy()
+        tissue_rois = df_grid_roi[df_grid_roi[intensity_col] >= intensity_threshold].copy()
         _selection_desc = f"intensity >= {intensity_threshold}"
     if len(tissue_rois) == 0:
         raise ValueError(
@@ -6015,13 +5772,9 @@ def classify_roi_blur_2d(
     df = df_grid_roi.copy()
 
     # Intensity column
-    intensity_col = (
-        "dapi_intensity" if "dapi_intensity" in df.columns else "raw_intensity"
-    )
+    intensity_col = "dapi_intensity" if "dapi_intensity" in df.columns else "raw_intensity"
     if intensity_col not in df.columns:
-        raise ValueError(
-            "Intensity column not found. Expected 'dapi_intensity' or 'raw_intensity'"
-        )
+        raise ValueError("Intensity column not found. Expected 'dapi_intensity' or 'raw_intensity'")
 
     # Focus column
     if focus_col_name not in df.columns:
@@ -6167,8 +5920,8 @@ def plot_grid_roi_focus_heatmap(
         Pixel-level focus maps from compute_all_focus_maps(). If provided,
         uses imshow for smooth rendering instead of Rectangle patches.
     """
-    from skimage.transform import downscale_local_mean
     from mpl_toolkits.axes_grid1 import make_axes_locatable
+    from skimage.transform import downscale_local_mean
 
     downsample_factor = 8
     img_height, img_width = small0.shape
@@ -6211,9 +5964,7 @@ def plot_grid_roi_focus_heatmap(
     if heatmap is None and focus_maps is not None:
         dapi_focus = focus_maps.get("dapi_focus_map")
         if dapi_focus is not None:
-            heatmap = downscale_local_mean(
-                dapi_focus, (downsample_factor, downsample_factor)
-            )
+            heatmap = downscale_local_mean(dapi_focus, (downsample_factor, downsample_factor))
     if heatmap is not None:
         # Binned redesign: an imshow of the full ~86-megapixel per-pixel field cost
         # ~126 s (it measured 4459.8 s on a 102045x53908 sample, runs 1ZyVIlaKBYxJrQ /
@@ -6254,9 +6005,7 @@ def plot_grid_roi_focus_heatmap(
             f"    [TIMING] fig5 left bin+imshow (step={step}, "
             f"{focus_binned.shape}): {time.perf_counter() - t_h:.1f}s"
         )
-        sm = plt.cm.ScalarMappable(
-            cmap="viridis", norm=plt.Normalize(vmin=vmin, vmax=vmax)
-        )
+        sm = plt.cm.ScalarMappable(cmap="viridis", norm=plt.Normalize(vmin=vmin, vmax=vmax))
         sm.set_array([])
         cax = make_axes_locatable(ax).append_axes("right", size="3%", pad=0.05)
         cbar = fig.colorbar(sm, cax=cax)
@@ -6279,9 +6028,7 @@ def plot_grid_roi_focus_heatmap(
                 continue
             norm_score = np.clip((roi["focus_score_norm"] + 3) / 6, 0, 1)
             color = plt.cm.viridis(norm_score)
-            rect = Rectangle(
-                (x1_ds, y1_ds), w, h, facecolor=color, alpha=0.6, edgecolor="none"
-            )
+            rect = Rectangle((x1_ds, y1_ds), w, h, facecolor=color, alpha=0.6, edgecolor="none")
             ax.add_patch(rect)
         sm = plt.cm.ScalarMappable(cmap="viridis", norm=plt.Normalize(vmin=-3, vmax=3))
         sm.set_array([])
@@ -6335,16 +6082,10 @@ def plot_grid_roi_focus_heatmap(
         # denominator; the fraction in focus is meaningless without it.
         infocus_ds = np.full((img_height, img_width), np.nan, dtype=np.float32)
         x1_arr = (df_grid_roi["x1"].values // downsample_factor).astype(int)
-        x2_arr = np.minimum(
-            df_grid_roi["x2"].values // downsample_factor, img_width
-        ).astype(int)
+        x2_arr = np.minimum(df_grid_roi["x2"].values // downsample_factor, img_width).astype(int)
         y1_arr = (df_grid_roi["y1"].values // downsample_factor).astype(int)
-        y2_arr = np.minimum(
-            df_grid_roi["y2"].values // downsample_factor, img_height
-        ).astype(int)
-        infocus_val = np.where(
-            df_grid_roi["is_blurred_gmm_2d"].values, 0.0, 1.0
-        ).astype(np.float32)
+        y2_arr = np.minimum(df_grid_roi["y2"].values // downsample_factor, img_height).astype(int)
+        infocus_val = np.where(df_grid_roi["is_blurred_gmm_2d"].values, 0.0, 1.0).astype(np.float32)
         for i in range(len(x1_arr)):
             infocus_ds[y1_arr[i] : y2_arr[i], x1_arr[i] : x2_arr[i]] = infocus_val[i]
         # Per-bin FRACTION in focus: mean of the 0/1 indicator over tissue pixels, on
@@ -6398,9 +6139,7 @@ def plot_grid_roi_focus_heatmap(
                 color = "blue" if not roi["is_blurred_gmm_2d"] else "red"
             else:
                 color = "blue" if roi["focus_score_norm"] > threshold else "red"
-            rect = Rectangle(
-                (x1_ds, y1_ds), w, h, facecolor=color, alpha=0.6, edgecolor="none"
-            )
+            rect = Rectangle((x1_ds, y1_ds), w, h, facecolor=color, alpha=0.6, edgecolor="none")
             ax.add_patch(rect)
         if has_gmm_2d:
             ax.set_title(
@@ -6423,9 +6162,7 @@ def plot_grid_roi_focus_heatmap(
         cax_r.axis("off")
 
     plt.tight_layout()
-    plt.savefig(
-        figures_dir / "grid_roi_focus_heatmap.png", dpi=300, bbox_inches="tight"
-    )
+    plt.savefig(figures_dir / "grid_roi_focus_heatmap.png", dpi=300, bbox_inches="tight")
     plt.close(fig)
 
     # Save data as CSV
@@ -6435,9 +6172,7 @@ def plot_grid_roi_focus_heatmap(
         df_grid_roi_scaled["x2_ds"] = df_grid_roi_scaled["x2"] / downsample_factor
         df_grid_roi_scaled["y1_ds"] = df_grid_roi_scaled["y1"] / downsample_factor
         df_grid_roi_scaled["y2_ds"] = df_grid_roi_scaled["y2"] / downsample_factor
-        df_grid_roi_scaled.to_csv(
-            figures_source_dir / "grid_roi_focus_heatmap.csv", index=False
-        )
+        df_grid_roi_scaled.to_csv(figures_source_dir / "grid_roi_focus_heatmap.csv", index=False)
 
 
 def plot_snr_roi_heatmap(
@@ -6504,18 +6239,10 @@ def plot_snr_roi_heatmap(
     fig, axes = plt.subplots(1, 2, figsize=(2 * panel_width + 2, panel_height))
 
     # Pre-compute downsampled tile coordinates (vectorized)
-    x1_arr = np.clip(
-        (df_plot["x1"].values / downsample_factor).astype(int), 0, img_width
-    )
-    x2_arr = np.clip(
-        (df_plot["x2"].values / downsample_factor).astype(int), 0, img_width
-    )
-    y1_arr = np.clip(
-        (df_plot["y1"].values / downsample_factor).astype(int), 0, img_height
-    )
-    y2_arr = np.clip(
-        (df_plot["y2"].values / downsample_factor).astype(int), 0, img_height
-    )
+    x1_arr = np.clip((df_plot["x1"].values / downsample_factor).astype(int), 0, img_width)
+    x2_arr = np.clip((df_plot["x2"].values / downsample_factor).astype(int), 0, img_width)
+    y1_arr = np.clip((df_plot["y1"].values / downsample_factor).astype(int), 0, img_height)
+    y2_arr = np.clip((df_plot["y2"].values / downsample_factor).astype(int), 0, img_height)
 
     def _draw_background(ax):
         # _imshow_thumb: downsample the ~86 Mpx DAPI background to the display
@@ -6578,9 +6305,7 @@ def plot_snr_roi_heatmap(
     _finish_ax(ax)
     ax.set_title("Negative Probe Fraction per Tile", fontsize=14)
 
-    sm = plt.cm.ScalarMappable(
-        cmap="RdYlGn_r", norm=plt.Normalize(vmin=0, vmax=_NEG_VMAX)
-    )
+    sm = plt.cm.ScalarMappable(cmap="RdYlGn_r", norm=plt.Normalize(vmin=0, vmax=_NEG_VMAX))
     sm.set_array([])
     cbar = plt.colorbar(sm, ax=ax, extend="max")
     cbar.set_label("neg_pct (fraction)", fontsize=12)
@@ -6588,9 +6313,7 @@ def plot_snr_roi_heatmap(
     _neg_warn = _t.get("neg_pct_warn")
     _neg_fail = _t.get("neg_pct_fail")
     if isinstance(_neg_warn, (int, float)):
-        cbar.ax.axhline(
-            y=float(_neg_warn), color="orange", linewidth=1.5, linestyle="--"
-        )
+        cbar.ax.axhline(y=float(_neg_warn), color="orange", linewidth=1.5, linestyle="--")
     if isinstance(_neg_fail, (int, float)):
         cbar.ax.axhline(y=float(_neg_fail), color="red", linewidth=1.5)
 
@@ -6646,9 +6369,7 @@ def plot_snr_roi_heatmap(
         fontsize=14,
     )
 
-    sm = plt.cm.ScalarMappable(
-        cmap="RdYlGn", norm=LogNorm(vmin=_RATIO_VMIN, vmax=_RATIO_VMAX)
-    )
+    sm = plt.cm.ScalarMappable(cmap="RdYlGn", norm=LogNorm(vmin=_RATIO_VMIN, vmax=_RATIO_VMAX))
     sm.set_array([])
     cbar = plt.colorbar(sm, ax=ax, extend="min")
     cbar.set_label(_ratio_cbar_label, fontsize=12)
@@ -6656,9 +6377,7 @@ def plot_snr_roi_heatmap(
     _ratio_warn = _t.get("ratio_warn")
     _ratio_fail = _t.get("ratio_fail")
     if isinstance(_ratio_warn, (int, float)) and float(_ratio_warn) > 0:
-        cbar.ax.axhline(
-            y=float(_ratio_warn), color="orange", linewidth=1.5, linestyle="--"
-        )
+        cbar.ax.axhline(y=float(_ratio_warn), color="orange", linewidth=1.5, linestyle="--")
     if isinstance(_ratio_fail, (int, float)) and float(_ratio_fail) > 0:
         cbar.ax.axhline(y=float(_ratio_fail), color="red", linewidth=1.5)
 
@@ -6704,9 +6423,7 @@ def plot_cross_section_concordance(
     required = {"focus_score", "roi_tx_snr_ratio", "neg_pct", "dapi_intensity"}
     missing = required - set(df_grid_roi.columns)
     if missing:
-        logging.warning(
-            "Skipping cross-section concordance plot: missing columns %s", missing
-        )
+        logging.warning("Skipping cross-section concordance plot: missing columns %s", missing)
         return
 
     # Filter to tissue ROIs with transcripts
@@ -6723,9 +6440,7 @@ def plot_cross_section_concordance(
     )
     df = df[mask]
     if len(df) < 10:
-        logging.warning(
-            "Skipping cross-section concordance: too few valid tiles (%d)", len(df)
-        )
+        logging.warning("Skipping cross-section concordance: too few valid tiles (%d)", len(df))
         return
 
     from scipy.stats import spearmanr
@@ -6750,9 +6465,7 @@ def plot_cross_section_concordance(
     sidx = _subsample_idx(np.ones(len(df), dtype=bool))
     # Color by GMM 2D classification if available
     if "is_blurred_gmm_2d" in df.columns and df["is_blurred_gmm_2d"].notna().any():
-        colors = np.where(
-            df["is_blurred_gmm_2d"].values[sidx].astype(bool), "#E57373", "#64B5F6"
-        )
+        colors = np.where(df["is_blurred_gmm_2d"].values[sidx].astype(bool), "#E57373", "#64B5F6")
     else:
         colors = "#64B5F6"
 
@@ -6814,10 +6527,7 @@ def plot_cross_section_concordance(
             otsu_db = df["snr_image_otsu_db"].values
             snr_ratio_arr = df["roi_tx_snr_ratio"].values
             sidx_o = _subsample_idx(_otsu_mask.values)
-            if (
-                "is_blurred_gmm_2d" in df.columns
-                and df["is_blurred_gmm_2d"].notna().any()
-            ):
+            if "is_blurred_gmm_2d" in df.columns and df["is_blurred_gmm_2d"].notna().any():
                 colors_o = np.where(
                     df["is_blurred_gmm_2d"].values[sidx_o].astype(bool),
                     "#E57373",
@@ -6898,9 +6608,7 @@ def plot_cross_section_concordance(
     neg_vals = df["neg_pct"].values
 
     if "is_blurred_gmm_2d" in df.columns and df["is_blurred_gmm_2d"].notna().any():
-        colors_r = np.where(
-            df["is_blurred_gmm_2d"].values[sidx].astype(bool), "#E57373", "#64B5F6"
-        )
+        colors_r = np.where(df["is_blurred_gmm_2d"].values[sidx].astype(bool), "#E57373", "#64B5F6")
     else:
         colors_r = "#64B5F6"
 
@@ -6928,12 +6636,8 @@ def plot_cross_section_concordance(
     )
     neg_warn = float(_t.get("neg_pct_warn", 0.15))
     neg_fail = float(_t.get("neg_pct_fail", 0.30))
-    ax.axhline(
-        neg_warn, ls="--", lw=1, color="orange", alpha=0.8, label=f"WARN = {neg_warn}"
-    )
-    ax.axhline(
-        neg_fail, ls="--", lw=1, color="red", alpha=0.8, label=f"FAIL = {neg_fail}"
-    )
+    ax.axhline(neg_warn, ls="--", lw=1, color="orange", alpha=0.8, label=f"WARN = {neg_warn}")
+    ax.axhline(neg_fail, ls="--", lw=1, color="red", alpha=0.8, label=f"FAIL = {neg_fail}")
     ax.legend(fontsize=9, loc="lower right")
     ax.grid(True, ls="--", alpha=0.3)
 
@@ -6957,9 +6661,7 @@ def plot_cross_section_concordance(
 
     plt.tight_layout()
     plt.savefig(figures_dir / "cross_section_concordance.png", dpi=200)
-    plt.savefig(
-        figures_dir / "cross_section_concordance.pdf", dpi=200, bbox_inches="tight"
-    )
+    plt.savefig(figures_dir / "cross_section_concordance.pdf", dpi=200, bbox_inches="tight")
     plt.close(fig)
 
     # Source data
@@ -6989,9 +6691,7 @@ def plot_cross_section_concordance(
     )
 
 
-def plot_roi_focus_vs_intensity(
-    df_grid_roi, figures_dir, figures_source_dir, threshold=-1.0
-):
+def plot_roi_focus_vs_intensity(df_grid_roi, figures_dir, figures_source_dir, threshold=-1.0):
     """
     Create scatter plot showing focus score vs raw DAPI intensity for tile threshold analysis.
     Uses log scale for intensity to better visualize the relationship.
@@ -7008,15 +6708,11 @@ def plot_roi_focus_vs_intensity(
         Threshold for normalized focus score (default: -1.0)
     """
     # Use dapi_intensity if available, otherwise raw_intensity
-    intensity_col = (
-        "dapi_intensity" if "dapi_intensity" in df_grid_roi.columns else "raw_intensity"
-    )
+    intensity_col = "dapi_intensity" if "dapi_intensity" in df_grid_roi.columns else "raw_intensity"
 
     # Calculate log10 of intensity (add small epsilon to avoid log(0))
     intensity_values = df_grid_roi[intensity_col].values
-    log_intensity = np.log10(
-        intensity_values + 1e-10
-    )  # Add small epsilon to handle any zeros
+    log_intensity = np.log10(intensity_values + 1e-10)  # Add small epsilon to handle any zeros
 
     # Phase v5: robust outlier handling for the rendered scatter.
     # (A) Filter to tissue tiles (tissue_coverage > 0.5) — empty / non-tissue
@@ -7064,9 +6760,7 @@ def plot_roi_focus_vs_intensity(
             valid_gmm_mask = valid_mask_plot2 & df_grid_roi["is_blurred_gmm_2d"].notna()
             if valid_gmm_mask.sum() > 0:
                 sidx = _subsample_idx(valid_gmm_mask)
-                is_blurred_sub = (
-                    df_grid_roi["is_blurred_gmm_2d"].values[sidx].astype(bool)
-                )
+                is_blurred_sub = df_grid_roi["is_blurred_gmm_2d"].values[sidx].astype(bool)
                 colors = np.where(is_blurred_sub, "red", "blue")
                 ax.scatter(
                     log_intensity[sidx],
@@ -7088,13 +6782,9 @@ def plot_roi_focus_vs_intensity(
 
                 # Add text annotation for GMM 2D (counts from full data, not subsample)
                 n_blurred = df_grid_roi.loc[valid_gmm_mask, "is_blurred_gmm_2d"].sum()
-                n_in_focus = (
-                    ~df_grid_roi.loc[valid_gmm_mask, "is_blurred_gmm_2d"]
-                ).sum()
+                n_in_focus = (~df_grid_roi.loc[valid_gmm_mask, "is_blurred_gmm_2d"]).sum()
                 pct_blurred = (
-                    n_blurred / valid_gmm_mask.sum() * 100
-                    if valid_gmm_mask.sum() > 0
-                    else 0
+                    n_blurred / valid_gmm_mask.sum() * 100 if valid_gmm_mask.sum() > 0 else 0
                 )
                 ax.text(
                     0.05,
@@ -7166,9 +6856,7 @@ def plot_roi_focus_vs_intensity(
     # the same subplots_adjust margins; identical (left, right, top, bottom)
     # ⇒ identical plot-box position regardless of y-tick label width.
     plt.subplots_adjust(left=0.13, right=0.95, top=0.88, bottom=0.18)
-    plt.savefig(
-        figures_dir / "roi_focus_vs_intensity.pdf", dpi=300, bbox_inches="tight"
-    )
+    plt.savefig(figures_dir / "roi_focus_vs_intensity.pdf", dpi=300, bbox_inches="tight")
     plt.savefig(figures_dir / "roi_focus_vs_intensity.png", dpi=300)
     plt.close(fig)
 
@@ -7179,20 +6867,14 @@ def plot_roi_focus_vs_intensity(
     df_scatter["log10_intensity"] = log_intensity
     df_scatter["is_low_nuclear_texture"] = df_scatter["focus_score_norm"] <= threshold
     if figures_source_dir is not None:
-        df_scatter.to_csv(
-            figures_source_dir / "roi_focus_vs_intensity.csv", index=False
-        )
+        df_scatter.to_csv(figures_source_dir / "roi_focus_vs_intensity.csv", index=False)
 
     # Print correlation statistics (using log intensity)
     correlation = np.corrcoef(log_intensity, df_grid_roi["focus_score_norm"])[0, 1]
-    logging.info(
-        f"  Correlation (log10(intensity) vs normalized focus score): {correlation:.4f}"
-    )
+    logging.info(f"  Correlation (log10(intensity) vs normalized focus score): {correlation:.4f}")
 
 
-def plot_roi_focus_distribution(
-    df_grid_roi, figures_dir, figures_source_dir, threshold=-1.0
-):
+def plot_roi_focus_distribution(df_grid_roi, figures_dir, figures_source_dir, threshold=-1.0):
     """Histogram of normalized focus scores on tissue-filtered tiles, with
     GMM 2D binary classification overlaid (red = blurred, blue = in-focus).
 
@@ -7303,9 +6985,7 @@ def plot_roi_focus_distribution(
         df_dist.to_csv(figures_source_dir / f"{save_stem}.csv", index=False)
 
     logging.info("  Focus score distribution summary (tissue tiles):")
-    logging.info(
-        f"    Normalized focus score - Mean: {mean_norm:.4f}, Median: {median_norm:.4f}"
-    )
+    logging.info(f"    Normalized focus score - Mean: {mean_norm:.4f}, Median: {median_norm:.4f}")
     logging.info(f"    Tiles blurred: {len(blurred)} ({pct_blurred:.1f}%)")
     logging.info(f"    Tiles in-focus: {len(in_focus)} ({100 - pct_blurred:.1f}%)")
 
@@ -7392,9 +7072,7 @@ def calculate_roi_intensities(xoa_morphology_files, df_grid_roi):
         df_roi_intensities["intrna_intensity"] = intrna_intensities
     else:
         df_roi_intensities["intrna_intensity"] = np.nan
-        logging.warning(
-            "Warning: IntRNA channel not available, setting intrna_intensity to NaN"
-        )
+        logging.warning("Warning: IntRNA channel not available, setting intrna_intensity to NaN")
 
     # Clean up
     del dapi_image
@@ -7621,9 +7299,7 @@ def plot_focus_score_vs_laplacian(df_grid_roi, figures_dir, figures_source_dir):
     df_valid = df_grid_roi[valid_mask].copy()
 
     if len(df_valid) == 0:
-        logging.warning(
-            "  Warning: No valid data for Laplacian comparison, skipping plots"
-        )
+        logging.warning("  Warning: No valid data for Laplacian comparison, skipping plots")
         return
 
     # Scatter plot: log1p(focus_score) vs log1p(laplacian_variance)
@@ -7678,9 +7354,7 @@ def plot_focus_score_vs_laplacian(df_grid_roi, figures_dir, figures_source_dir):
     ax.set_xlabel("log(1 + std²/mean) (DAPI)", fontsize=12)
     ax.set_ylabel("log(1 + Laplacian variance) (DAPI)", fontsize=12)
     if has_gmm_2d:
-        ax.set_title(
-            "Focus Score vs Laplacian Variance (2D GMM Classification)", fontsize=14
-        )
+        ax.set_title("Focus Score vs Laplacian Variance (2D GMM Classification)", fontsize=14)
     else:
         ax.set_title("Focus Score vs Laplacian Variance", fontsize=14)
     ax.grid(True, alpha=0.3)
@@ -7735,14 +7409,12 @@ def plot_focus_score_vs_laplacian(df_grid_roi, figures_dir, figures_source_dir):
     df_comparison["log1p_focus_score"] = np.log1p(df_comparison[focus_col])
     df_comparison["log1p_lap_var"] = np.log1p(df_comparison["dapi_lap_var"])
     if figures_source_dir is not None:
-        df_comparison.to_csv(
-            figures_source_dir / "focus_score_vs_laplacian.csv", index=False
-        )
+        df_comparison.to_csv(figures_source_dir / "focus_score_vs_laplacian.csv", index=False)
 
     # Calculate correlation
-    correlation = np.corrcoef(
-        np.log1p(df_valid[focus_col]), np.log1p(df_valid["dapi_lap_var"])
-    )[0, 1]
+    correlation = np.corrcoef(np.log1p(df_valid[focus_col]), np.log1p(df_valid["dapi_lap_var"]))[
+        0, 1
+    ]
     logging.info(f"  Correlation (log1p): {correlation:.4f}")
 
 
@@ -7773,12 +7445,8 @@ def plot_intensity_assessment(
     fig, axes = plt.subplots(2, 3, figsize=(15, 9))
 
     # Calculate ROI centers
-    df_roi_intensities["center_x"] = (
-        df_roi_intensities["x1"] + df_roi_intensities["x2"]
-    ) / 2
-    df_roi_intensities["center_y"] = (
-        df_roi_intensities["y1"] + df_roi_intensities["y2"]
-    ) / 2
+    df_roi_intensities["center_x"] = (df_roi_intensities["x1"] + df_roi_intensities["x2"]) / 2
+    df_roi_intensities["center_y"] = (df_roi_intensities["y1"] + df_roi_intensities["y2"]) / 2
 
     channels = [
         ("dapi", "DAPI", intensity_stats["dapi"]),
@@ -7797,9 +7465,7 @@ def plot_intensity_assessment(
 
         # Check if channel is available
         is_available = not np.all(np.isnan(intensities))
-        intensities_valid = (
-            intensities[~np.isnan(intensities)] if is_available else np.array([])
-        )
+        intensities_valid = intensities[~np.isnan(intensities)] if is_available else np.array([])
 
         # Row 1: Distribution plots
         ax = axes[0, col_idx]
@@ -7897,12 +7563,7 @@ def plot_intensity_assessment(
             # Filter coordinates to be within image bounds
             x_vals = x_scaled.values if hasattr(x_scaled, "values") else x_scaled
             y_vals = y_scaled.values if hasattr(y_scaled, "values") else y_scaled
-            in_bounds = (
-                (x_vals >= 0)
-                & (x_vals < img_width)
-                & (y_vals >= 0)
-                & (y_vals < img_height)
-            )
+            in_bounds = (x_vals >= 0) & (x_vals < img_width) & (y_vals >= 0) & (y_vals < img_height)
             valid_mask = valid_mask & in_bounds
 
             if valid_mask.sum() > 0:
@@ -7973,9 +7634,7 @@ def plot_intensity_assessment(
     # Save source data
     if figures_source_dir is None:
         return
-    df_roi_intensities.to_csv(
-        figures_source_dir / "intensity_assessment.csv", index=False
-    )
+    df_roi_intensities.to_csv(figures_source_dir / "intensity_assessment.csv", index=False)
 
     # Save statistics summary
     df_stats = pd.DataFrame(
@@ -8018,9 +7677,7 @@ def plot_intensity_assessment(
             ],
         }
     )
-    df_stats.to_csv(
-        figures_source_dir / "intensity_assessment_statistics.csv", index=False
-    )
+    df_stats.to_csv(figures_source_dir / "intensity_assessment_statistics.csv", index=False)
 
 
 def generate_roi_figures(
@@ -8072,9 +7729,7 @@ def generate_roi_figures(
         YAML ``snr.roi_tx`` block for SNR heatmap threshold lines
     """
     figures_dir = data["figures_dir"]
-    figures_source_dir = (
-        (figures_dir / "figures_source") if figure_source_tables else None
-    )
+    figures_source_dir = (figures_dir / "figures_source") if figure_source_tables else None
     if figures_source_dir is not None:
         figures_source_dir.mkdir(parents=True, exist_ok=True)
     # Create methodology assessment folder for comparison figures
@@ -8090,9 +7745,7 @@ def generate_roi_figures(
         distance_map = multistain_distance_map
     if multistain_distance_map2 is not None:
         distance_map2 = multistain_distance_map2
-    _dm_mask = (
-        whole_sample if multistain_whole_sample is None else multistain_whole_sample
-    )
+    _dm_mask = whole_sample if multistain_whole_sample is None else multistain_whole_sample
 
     def _fig1_distance_edge():
         logging.info("Generating Figure 1: Distance map (edge)...")
@@ -8123,14 +7776,10 @@ def generate_roi_figures(
         if _dm_mask.shape == distance_map.shape:
             _dist_um = np.abs(distance_map) * 8 * 0.2125
             _dm_edge = np.where(_dm_mask > 0, _dist_um, np.nan)
-            im = _imshow_thumb(
-                ax, _dm_edge, cmap=_cmap_edge, vmin=0.0, vmax=_EDGE_VMAX_UM
-            )
+            im = _imshow_thumb(ax, _dm_edge, cmap=_cmap_edge, vmin=0.0, vmax=_EDGE_VMAX_UM)
             _edge_cbar_extend = "max"
         else:
-            _dm_edge = (
-                distance_map  # fallback: shapes mismatch, preserve prior behaviour
-            )
+            _dm_edge = distance_map  # fallback: shapes mismatch, preserve prior behaviour
             im = _imshow_thumb(ax, _dm_edge, cmap=_cmap_edge)
             _edge_cbar_extend = "neither"
         if _dm_mask.shape == distance_map.shape:
@@ -8150,9 +7799,7 @@ def generate_roi_figures(
         # Explicit "300+" label at the cap when extend="max" is active
         if _edge_cbar_extend == "max":
             cbar.set_ticks([0, 50, 100, 150, 200, 250, _EDGE_VMAX_UM])
-            cbar.set_ticklabels(
-                ["0", "50", "100", "150", "200", "250", f"{int(_EDGE_VMAX_UM)}+"]
-            )
+            cbar.set_ticklabels(["0", "50", "100", "150", "200", "250", f"{int(_EDGE_VMAX_UM)}+"])
         plt.tight_layout()
         plt.savefig(figures_dir / "distance_map_edge.pdf", dpi=300, bbox_inches="tight")
         plt.savefig(figures_dir / "distance_map_edge.png", dpi=300, bbox_inches="tight")
@@ -8168,9 +7815,7 @@ def generate_roi_figures(
                 index=False,
                 header=False,
             )
-        logging.info(
-            f"[TIMING] Figure 1 (distance map edge): {time.time() - t_fig:.1f}s"
-        )
+        logging.info(f"[TIMING] Figure 1 (distance map edge): {time.time() - t_fig:.1f}s")
 
     def _fig2_distance_holes():
         logging.info("Generating Figure 2: Distance map (holes)...")
@@ -8196,9 +7841,7 @@ def generate_roi_figures(
         if _dm_mask.shape == distance_map2.shape:
             _dist_um_h = np.abs(distance_map2) * 8 * 0.2125
             _dm_holes = np.where(_dm_mask > 0, _dist_um_h, np.nan)
-            im = _imshow_thumb(
-                ax, _dm_holes, cmap=_cmap_holes, vmin=0.0, vmax=_HOLES_VMAX_UM
-            )
+            im = _imshow_thumb(ax, _dm_holes, cmap=_cmap_holes, vmin=0.0, vmax=_HOLES_VMAX_UM)
             _holes_cbar_extend = "max"
         else:
             _dm_holes = distance_map2  # fallback: shapes mismatch
@@ -8221,16 +7864,10 @@ def generate_roi_figures(
         # Explicit "300+" label at the cap when extend="max" is active.
         if _holes_cbar_extend == "max":
             cbar.set_ticks([0, 50, 100, 150, 200, 250, _HOLES_VMAX_UM])
-            cbar.set_ticklabels(
-                ["0", "50", "100", "150", "200", "250", f"{int(_HOLES_VMAX_UM)}+"]
-            )
+            cbar.set_ticklabels(["0", "50", "100", "150", "200", "250", f"{int(_HOLES_VMAX_UM)}+"])
         plt.tight_layout()
-        plt.savefig(
-            figures_dir / "distance_map_holes.pdf", dpi=300, bbox_inches="tight"
-        )
-        plt.savefig(
-            figures_dir / "distance_map_holes.png", dpi=300, bbox_inches="tight"
-        )
+        plt.savefig(figures_dir / "distance_map_holes.pdf", dpi=300, bbox_inches="tight")
+        plt.savefig(figures_dir / "distance_map_holes.png", dpi=300, bbox_inches="tight")
         plt.close(fig)
         # Full-resolution export (see distance_map_edge.csv note): gated behind
         # --figure-source-tables (off by default); rendering uses the display-res thumbnail.
@@ -8240,9 +7877,7 @@ def generate_roi_figures(
                 index=False,
                 header=False,
             )
-        logging.info(
-            f"[TIMING] Figure 2 (distance map holes): {time.time() - t_fig:.1f}s"
-        )
+        logging.info(f"[TIMING] Figure 2 (distance map holes): {time.time() - t_fig:.1f}s")
 
     def _fig2b_distance_combined():
         """Two-panel combined figure: distance to edge (left) + distance to
@@ -8290,9 +7925,7 @@ def generate_roi_figures(
         cbar_e.set_label("Distance from edge (µm)")
         if _edge_extend == "max":
             cbar_e.set_ticks([0, 50, 100, 150, 200, 250, _VMAX_UM])
-            cbar_e.set_ticklabels(
-                ["0", "50", "100", "150", "200", "250", f"{int(_VMAX_UM)}+"]
-            )
+            cbar_e.set_ticklabels(["0", "50", "100", "150", "200", "250", f"{int(_VMAX_UM)}+"])
 
         # ── Right panel: distance to holes ─────────────────────────────
         ax = axes[1]
@@ -8319,17 +7952,13 @@ def generate_roi_figures(
         cbar_h.set_label("Distance from nearest hole (µm)")
         if _holes_extend == "max":
             cbar_h.set_ticks([0, 50, 100, 150, 200, 250, _VMAX_UM])
-            cbar_h.set_ticklabels(
-                ["0", "50", "100", "150", "200", "250", f"{int(_VMAX_UM)}+"]
-            )
+            cbar_h.set_ticklabels(["0", "50", "100", "150", "200", "250", f"{int(_VMAX_UM)}+"])
 
         plt.tight_layout()
         plt.savefig(figures_dir / "distance_maps.png", dpi=300, bbox_inches="tight")
         plt.savefig(figures_dir / "distance_maps.pdf", dpi=300, bbox_inches="tight")
         plt.close(fig)
-        logging.info(
-            f"[TIMING] Figure 2b (distance combined): {time.time() - t_fig:.1f}s"
-        )
+        logging.info(f"[TIMING] Figure 2b (distance combined): {time.time() - t_fig:.1f}s")
 
     def _fig3_morphology_overview():
         logging.info("Generating Figure 3: Morphology overview...")
@@ -8355,12 +7984,8 @@ def generate_roi_figures(
         ax[2].set_aspect("equal")
         ax[2].axis("off")
         plt.tight_layout()
-        plt.savefig(
-            figures_dir / "morphology_overview.pdf", dpi=300, bbox_inches="tight"
-        )
-        plt.savefig(
-            figures_dir / "morphology_overview.png", dpi=300, bbox_inches="tight"
-        )
+        plt.savefig(figures_dir / "morphology_overview.pdf", dpi=300, bbox_inches="tight")
+        plt.savefig(figures_dir / "morphology_overview.png", dpi=300, bbox_inches="tight")
         plt.close(fig)
         # Full-resolution export (see distance_map_edge.csv note): four ~86-Mpx channel
         # grids, gated behind --figure-source-tables (off by default); rendering uses
@@ -8386,9 +8011,7 @@ def generate_roi_figures(
                 index=False,
                 header=False,
             )
-        logging.info(
-            f"[TIMING] Figure 3 (morphology overview): {time.time() - t_fig:.1f}s"
-        )
+        logging.info(f"[TIMING] Figure 3 (morphology overview): {time.time() - t_fig:.1f}s")
 
     def _fig4_imageqc_masks():
         logging.info("Generating Figure 4: ImageQC masks...")
@@ -8402,9 +8025,7 @@ def generate_roi_figures(
         # §2.3 tissue mask shows the EXTENT mask (all available stains) so it matches the
         # reported tissue coverage; falls back to the DAPI mask on single-stain slides.
         _extent_ws = (
-            multistain_whole_sample
-            if multistain_whole_sample is not None
-            else whole_sample
+            multistain_whole_sample if multistain_whole_sample is not None else whole_sample
         )
         fig, ax = plt.subplots(1, 3, figsize=(3 * _panel_width, _panel_height))
         ax[0].set_title("Tissue mask (all stains)", fontsize=14)
@@ -8416,9 +8037,7 @@ def generate_roi_figures(
         ax[1].set_aspect("equal")
         ax[1].axis("off")
         ax[2].set_title("Optically dense regions", fontsize=14)
-        _imshow_thumb(
-            ax[2], dense_intensity_regions, rgb=lambda d: color.label2rgb(d, bg_label=0)
-        )
+        _imshow_thumb(ax[2], dense_intensity_regions, rgb=lambda d: color.label2rgb(d, bg_label=0))
         ax[2].set_aspect("equal")
         ax[2].axis("off")
         plt.tight_layout()
@@ -8464,32 +8083,20 @@ def generate_roi_figures(
     def _fig5b_focus_vs_intensity():
         logging.info("Generating Figure 5b: Tile focus score vs intensity...")
         t_fig = time.time()
-        plot_roi_focus_vs_intensity(
-            df_grid_roi, figures_dir, figures_source_dir, threshold=-1.0
-        )
-        logging.info(
-            f"[TIMING] Figure 5b (focus vs intensity): {time.time() - t_fig:.1f}s"
-        )
+        plot_roi_focus_vs_intensity(df_grid_roi, figures_dir, figures_source_dir, threshold=-1.0)
+        logging.info(f"[TIMING] Figure 5b (focus vs intensity): {time.time() - t_fig:.1f}s")
 
     def _fig5c_focus_distribution():
         logging.info("Generating Figure 5c: Tile focus score distribution...")
         t_fig = time.time()
-        plot_roi_focus_distribution(
-            df_grid_roi, figures_dir, figures_source_dir, threshold=-1.0
-        )
-        logging.info(
-            f"[TIMING] Figure 5c (focus distribution): {time.time() - t_fig:.1f}s"
-        )
+        plot_roi_focus_distribution(df_grid_roi, figures_dir, figures_source_dir, threshold=-1.0)
+        logging.info(f"[TIMING] Figure 5c (focus distribution): {time.time() - t_fig:.1f}s")
 
     def _fig5d_focus_vs_laplacian():
-        logging.info(
-            "Generating Figure 5d: Focus score vs Laplacian variance comparison..."
-        )
+        logging.info("Generating Figure 5d: Focus score vs Laplacian variance comparison...")
         t_fig = time.time()
         plot_focus_score_vs_laplacian(df_grid_roi, figures_dir, figures_source_dir)
-        logging.info(
-            f"[TIMING] Figure 5d (focus vs Laplacian): {time.time() - t_fig:.1f}s"
-        )
+        logging.info(f"[TIMING] Figure 5d (focus vs Laplacian): {time.time() - t_fig:.1f}s")
 
     def _fig6_intensity_assessment():
         logging.info("Generating Figure 6: Intensity assessment...")
@@ -8497,9 +8104,7 @@ def generate_roi_figures(
         plot_intensity_assessment(
             df_roi_intensities, intensity_stats, small0, figures_dir, figures_source_dir
         )
-        logging.info(
-            f"[TIMING] Figure 6 (intensity assessment): {time.time() - t_fig:.1f}s"
-        )
+        logging.info(f"[TIMING] Figure 6 (intensity assessment): {time.time() - t_fig:.1f}s")
 
     def _fig7_snr_heatmap():
         if "neg_pct" not in df_grid_roi.columns:
@@ -8633,14 +8238,8 @@ def save_roi_qc_metrics(
             df_grid_roi["y1"].to_numpy(np.int64, copy=False),
             df_grid_roi["y2"].to_numpy(np.int64, copy=False),
         )
-        _ext_dmap = (
-            distance_map if multistain_distance_map is None else multistain_distance_map
-        )
-        _ext_dmap2 = (
-            distance_map2
-            if multistain_distance_map2 is None
-            else multistain_distance_map2
-        )
+        _ext_dmap = distance_map if multistain_distance_map is None else multistain_distance_map
+        _ext_dmap2 = distance_map2 if multistain_distance_map2 is None else multistain_distance_map2
     else:
         _ext_cov = (
             df_grid_roi["tissue_coverage"].to_numpy(np.float64, copy=False)
@@ -8702,37 +8301,24 @@ def save_roi_qc_metrics(
         "status": "PASS" if rois_in_tissue > 0 else "FAIL",
         "rois_in_tissue": rois_in_tissue,
         "total_rois": total_rois,
-        "tissue_roi_fraction": float(rois_in_tissue / total_rois)
-        if total_rois > 0
-        else 0.0,
+        "tissue_roi_fraction": float(rois_in_tissue / total_rois) if total_rois > 0 else 0.0,
     }
 
     # Mask-independent stain percentiles (p95 / p99 over the WHOLE tile grid,
     # 2026-06-23, qc_threshold_refinement §5.5). See
     # compute_whole_grid_stain_percentiles for the diagnostic-only rationale.
-    roi_metrics["stain_percentiles_whole_grid"] = compute_whole_grid_stain_percentiles(
-        df_grid_roi
-    )
+    roi_metrics["stain_percentiles_whole_grid"] = compute_whole_grid_stain_percentiles(df_grid_roi)
 
     # Optional: add GMM-based blur summary if columns are present
-    if (
-        "is_blurred_gmm" in df_grid_roi.columns
-        and "is_low_intensity" in df_grid_roi.columns
-    ):
+    if "is_blurred_gmm" in df_grid_roi.columns and "is_low_intensity" in df_grid_roi.columns:
         total_rois = len(df_grid_roi)
         n_blurred = int(df_grid_roi["is_blurred_gmm"].sum())
         n_low_int = int(df_grid_roi["is_low_intensity"].sum())
         if "tissue_coverage" in df_grid_roi.columns:
-            tissue_mask_qc = (
-                df_grid_roi["tissue_coverage"] >= min_tissue_coverage_for_qc
-            )
+            tissue_mask_qc = df_grid_roi["tissue_coverage"] >= min_tissue_coverage_for_qc
             total_rois_tissue = int(tissue_mask_qc.sum())
-            n_blurred_tissue = int(
-                df_grid_roi.loc[tissue_mask_qc, "is_blurred_gmm"].sum()
-            )
-            n_low_int_tissue = int(
-                df_grid_roi.loc[tissue_mask_qc, "is_low_intensity"].sum()
-            )
+            n_blurred_tissue = int(df_grid_roi.loc[tissue_mask_qc, "is_blurred_gmm"].sum())
+            n_low_int_tissue = int(df_grid_roi.loc[tissue_mask_qc, "is_low_intensity"].sum())
         else:
             total_rois_tissue = total_rois
             n_blurred_tissue = n_blurred
@@ -8742,24 +8328,16 @@ def save_roi_qc_metrics(
             "total_rois": total_rois,
             "rois_blurred_gmm": n_blurred,
             "rois_low_intensity": n_low_int,
-            "pct_blurred_gmm": float(n_blurred / total_rois * 100.0)
-            if total_rois > 0
-            else 0.0,
-            "pct_low_intensity": float(n_low_int / total_rois * 100.0)
-            if total_rois > 0
-            else 0.0,
+            "pct_blurred_gmm": float(n_blurred / total_rois * 100.0) if total_rois > 0 else 0.0,
+            "pct_low_intensity": float(n_low_int / total_rois * 100.0) if total_rois > 0 else 0.0,
             # Tissue-aware denominator for report-level interpretation
             "total_rois_tissue_filtered": total_rois_tissue,
             "rois_blurred_gmm_tissue_filtered": n_blurred_tissue,
             "rois_low_intensity_tissue_filtered": n_low_int_tissue,
-            "pct_blurred_gmm_tissue_filtered": float(
-                n_blurred_tissue / total_rois_tissue * 100.0
-            )
+            "pct_blurred_gmm_tissue_filtered": float(n_blurred_tissue / total_rois_tissue * 100.0)
             if total_rois_tissue > 0
             else 0.0,
-            "pct_low_intensity_tissue_filtered": float(
-                n_low_int_tissue / total_rois_tissue * 100.0
-            )
+            "pct_low_intensity_tissue_filtered": float(n_low_int_tissue / total_rois_tissue * 100.0)
             if total_rois_tissue > 0
             else 0.0,
             "tissue_coverage_min_for_qc": float(min_tissue_coverage_for_qc),
@@ -8769,9 +8347,7 @@ def save_roi_qc_metrics(
             valid_probs = df_grid_roi["blur_prob_gmm"].dropna()
             if len(valid_probs) > 0:
                 roi_metrics["blur_gmm_1d"]["blur_prob_mean"] = float(valid_probs.mean())
-                roi_metrics["blur_gmm_1d"]["blur_prob_median"] = float(
-                    valid_probs.median()
-                )
+                roi_metrics["blur_gmm_1d"]["blur_prob_median"] = float(valid_probs.median())
 
     # Optional: add 2D GMM-based blur summary if columns are present
     if "is_blurred_gmm_2d" in df_grid_roi.columns:
@@ -8783,13 +8359,9 @@ def save_roi_qc_metrics(
             else 0
         )
         if "tissue_coverage" in df_grid_roi.columns:
-            tissue_mask_qc = (
-                df_grid_roi["tissue_coverage"] >= min_tissue_coverage_for_qc
-            )
+            tissue_mask_qc = df_grid_roi["tissue_coverage"] >= min_tissue_coverage_for_qc
             total_rois_tissue = int(tissue_mask_qc.sum())
-            n_blurred_tissue = int(
-                df_grid_roi.loc[tissue_mask_qc, "is_blurred_gmm_2d"].sum()
-            )
+            n_blurred_tissue = int(df_grid_roi.loc[tissue_mask_qc, "is_blurred_gmm_2d"].sum())
             n_low_int_tissue = (
                 int(df_grid_roi.loc[tissue_mask_qc, "is_low_intensity"].sum())
                 if "is_low_intensity" in df_grid_roi.columns
@@ -8804,24 +8376,16 @@ def save_roi_qc_metrics(
             "total_rois": total_rois,
             "rois_blurred_gmm": n_blurred_2d,
             "rois_low_intensity": n_low_int,
-            "pct_blurred_gmm": float(n_blurred_2d / total_rois * 100.0)
-            if total_rois > 0
-            else 0.0,
-            "pct_low_intensity": float(n_low_int / total_rois * 100.0)
-            if total_rois > 0
-            else 0.0,
+            "pct_blurred_gmm": float(n_blurred_2d / total_rois * 100.0) if total_rois > 0 else 0.0,
+            "pct_low_intensity": float(n_low_int / total_rois * 100.0) if total_rois > 0 else 0.0,
             # Tissue-aware denominator for report-level interpretation
             "total_rois_tissue_filtered": total_rois_tissue,
             "rois_blurred_gmm_tissue_filtered": n_blurred_tissue,
             "rois_low_intensity_tissue_filtered": n_low_int_tissue,
-            "pct_blurred_gmm_tissue_filtered": float(
-                n_blurred_tissue / total_rois_tissue * 100.0
-            )
+            "pct_blurred_gmm_tissue_filtered": float(n_blurred_tissue / total_rois_tissue * 100.0)
             if total_rois_tissue > 0
             else 0.0,
-            "pct_low_intensity_tissue_filtered": float(
-                n_low_int_tissue / total_rois_tissue * 100.0
-            )
+            "pct_low_intensity_tissue_filtered": float(n_low_int_tissue / total_rois_tissue * 100.0)
             if total_rois_tissue > 0
             else 0.0,
             "tissue_coverage_min_for_qc": float(min_tissue_coverage_for_qc),
@@ -8831,38 +8395,26 @@ def save_roi_qc_metrics(
             valid_probs = df_grid_roi["blur_prob_gmm_2d"].dropna()
             if len(valid_probs) > 0:
                 roi_metrics["blur_gmm_2d"]["blur_prob_mean"] = float(valid_probs.mean())
-                roi_metrics["blur_gmm_2d"]["blur_prob_median"] = float(
-                    valid_probs.median()
-                )
+                roi_metrics["blur_gmm_2d"]["blur_prob_median"] = float(valid_probs.median())
 
         # Compare 1D vs 2D if both exist
         if "is_blurred_gmm" in df_grid_roi.columns:
-            both_blurred = (
-                df_grid_roi["is_blurred_gmm"] & df_grid_roi["is_blurred_gmm_2d"]
-            ).sum()
+            both_blurred = (df_grid_roi["is_blurred_gmm"] & df_grid_roi["is_blurred_gmm_2d"]).sum()
             both_in_focus = (
                 (~df_grid_roi["is_blurred_gmm"]) & (~df_grid_roi["is_blurred_gmm_2d"])
             ).sum()
             agreement = (
-                (both_blurred + both_in_focus) / total_rois * 100.0
-                if total_rois > 0
-                else 0.0
+                (both_blurred + both_in_focus) / total_rois * 100.0 if total_rois > 0 else 0.0
             )
             roi_metrics["gmm_comparison"] = {
                 "agreement_pct": float(agreement),
                 "both_blurred": int(both_blurred),
                 "both_in_focus": int(both_in_focus),
                 "only_1d_blurred": int(
-                    (
-                        df_grid_roi["is_blurred_gmm"]
-                        & ~df_grid_roi["is_blurred_gmm_2d"]
-                    ).sum()
+                    (df_grid_roi["is_blurred_gmm"] & ~df_grid_roi["is_blurred_gmm_2d"]).sum()
                 ),
                 "only_2d_blurred": int(
-                    (
-                        ~df_grid_roi["is_blurred_gmm"]
-                        & df_grid_roi["is_blurred_gmm_2d"]
-                    ).sum()
+                    (~df_grid_roi["is_blurred_gmm"] & df_grid_roi["is_blurred_gmm_2d"]).sum()
                 ),
             }
 
@@ -8930,17 +8482,13 @@ def save_roi_qc_metrics(
             else ("raw_intensity" if "raw_intensity" in df_grid_roi.columns else None)
         )
         if _intensity_col is not None:
-            low_intensity_mask = (
-                df_grid_roi[_intensity_col].to_numpy() < DAPI_LOW_INTENSITY_FLOOR
-            )
+            low_intensity_mask = df_grid_roi[_intensity_col].to_numpy() < DAPI_LOW_INTENSITY_FLOOR
         else:
             low_intensity_mask = np.zeros(len(df_grid_roi), dtype=bool)
         bad_mask = blurred_mask | low_intensity_mask
 
         usable_tissue_frac = (
-            float((qc_tissue_mask & (~bad_mask)).sum() / n_qc_tissue)
-            if n_qc_tissue > 0
-            else None
+            float((qc_tissue_mask & (~bad_mask)).sum() / n_qc_tissue) if n_qc_tissue > 0 else None
         )
 
         # Largest contiguous bad zone (4-neighbour) over ROI grid.
@@ -9041,9 +8589,7 @@ def save_roi_qc_metrics(
             # Separation of 2D-GMM blur components in log1p(lap_var) space (Cohen's d).
             component_separation = None
             if "is_blurred_gmm_2d" in df_grid_roi.columns:
-                blur2d = df_grid_roi["is_blurred_gmm_2d"].to_numpy(bool, copy=False)[
-                    mask
-                ]
+                blur2d = df_grid_roi["is_blurred_gmm_2d"].to_numpy(bool, copy=False)[mask]
                 if blur2d.any() and (~blur2d).any():
                     lap_log = np.log1p(np.maximum(lap_used, 0.0))
                     lap_blur = lap_log[blur2d]
@@ -9054,15 +8600,13 @@ def save_roi_qc_metrics(
                         v_focus = float(np.var(lap_focus, ddof=1))
                         pooled_sd = np.sqrt(
                             max(
-                                ((n_b - 1) * v_blur + (n_f - 1) * v_focus)
-                                / (n_b + n_f - 2),
+                                ((n_b - 1) * v_blur + (n_f - 1) * v_focus) / (n_b + n_f - 2),
                                 0.0,
                             )
                             + 1e-12
                         )
                         component_separation = float(
-                            abs(float(np.mean(lap_focus)) - float(np.mean(lap_blur)))
-                            / pooled_sd
+                            abs(float(np.mean(lap_focus)) - float(np.mean(lap_blur))) / pooled_sd
                         )
 
             roi_metrics["laplacian_sharpness"] = {
@@ -9132,9 +8676,7 @@ def save_versions_file(outdir):
     def get_version(package, package_name=None):
         """Safely get version of a package"""
         if package_name is None:
-            package_name = (
-                package.__name__ if hasattr(package, "__name__") else str(package)
-            )
+            package_name = package.__name__ if hasattr(package, "__name__") else str(package)
 
         try:
             if hasattr(package, "__version__"):
@@ -9148,9 +8690,7 @@ def save_versions_file(outdir):
             return "unknown"
 
     # Get Python version
-    python_version = (
-        f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
-    )
+    python_version = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
 
     # Get package versions safely
     packages = {
@@ -9191,6 +8731,8 @@ def save_versions_file(outdir):
         packages["napari-skimage-regionprops"] = "unknown"
 
     try:
+        import napari_simpleitk_image_processing as nsitk
+
         packages["napari-simpleitk-image-processing"] = get_version(
             nsitk, "napari-simpleitk-image-processing"
         )
@@ -9270,9 +8812,7 @@ def load_spatial_data(data):
         columns={"Barcode": "cell_id", "Cluster": "Cluster_kmeans10"}
     )
     df_UMAP = pd.read_csv(data["umap_path"]).rename(columns={"Barcode": "cell_id"})
-    df_spatial = df_spatial.merge(df_clusters, on="cell_id").merge(
-        df_UMAP, on="cell_id"
-    )
+    df_spatial = df_spatial.merge(df_clusters, on="cell_id").merge(df_UMAP, on="cell_id")
     return df_spatial, cellseg_mask, cell_masks_zarr
 
 
@@ -9432,26 +8972,20 @@ def map_grid_roi_to_cells(df_grid_roi, df_cells, overlapping=False):
             # samples) and manufacturing cell-vs-tile disagreement. The slow
             # containment path below is the reference; see
             # tests/test_cell_roi_mapping.py.
-            cell_gx = np.clip(
-                np.floor((cell_x - x_min) / stride).astype(int), 0, n_cols - 1
-            )
-            cell_gy = np.clip(
-                np.floor((cell_y - y_min) / stride).astype(int), 0, n_rows - 1
-            )
+            cell_gx = np.clip(np.floor((cell_x - x_min) / stride).astype(int), 0, n_cols - 1)
+            cell_gy = np.clip(np.floor((cell_y - y_min) / stride).astype(int), 0, n_rows - 1)
             cell_roi_idx = grid_lookup[cell_gy, cell_gx]  # vectorized!
 
             matched_mask = cell_roi_idx >= 0
             cell_roi_matches[matched_mask] = df_grid_roi["roi_id"].values[
                 cell_roi_idx[matched_mask]
             ]
-            cell_roi_tissue_coverage_arr[matched_mask] = df_grid_roi[
-                "tissue_coverage"
-            ].values[cell_roi_idx[matched_mask]]
+            cell_roi_tissue_coverage_arr[matched_mask] = df_grid_roi["tissue_coverage"].values[
+                cell_roi_idx[matched_mask]
+            ]
 
             is_regular_grid = True
-            logging.info(
-                f"  Using fast grid lookup (stride={stride}px, grid={n_cols}x{n_rows})..."
-            )
+            logging.info(f"  Using fast grid lookup (stride={stride}px, grid={n_cols}x{n_rows})...")
 
     if not is_regular_grid:
         # SLOW PATH: Irregular/filtered grid - fallback for grids that don't validate
@@ -9473,10 +9007,7 @@ def map_grid_roi_to_cells(df_grid_roi, df_cells, overlapping=False):
             y_cell = cell_y[cell_idx]
 
             matches = (
-                (roi_x1 <= x_cell)
-                & (x_cell < roi_x2)
-                & (roi_y1 <= y_cell)
-                & (y_cell < roi_y2)
+                (roi_x1 <= x_cell) & (x_cell < roi_x2) & (roi_y1 <= y_cell) & (y_cell < roi_y2)
             )
 
             if np.any(matches):
@@ -9502,18 +9033,14 @@ def map_grid_roi_to_cells(df_grid_roi, df_cells, overlapping=False):
 
     # Build vectorized column arrays from df_grid_roi for direct indexing
     # Map roi_id -> index in df_grid_roi for O(1) lookup
-    roi_id_to_idx = pd.Series(
-        range(len(df_grid_roi)), index=df_grid_roi["roi_id"].values
-    )
+    roi_id_to_idx = pd.Series(range(len(df_grid_roi)), index=df_grid_roi["roi_id"].values)
 
     # Resolve column names (handle legacy naming)
     _dapi_intensity_col = (
         "dapi_intensity" if "dapi_intensity" in df_grid_roi.columns else "raw_intensity"
     )
     _dapi_focus_col = (
-        "dapi_focus_score"
-        if "dapi_focus_score" in df_grid_roi.columns
-        else "focus_score"
+        "dapi_focus_score" if "dapi_focus_score" in df_grid_roi.columns else "focus_score"
     )
     _dapi_focus_norm_col = (
         "dapi_focus_score_norm"
@@ -9534,20 +9061,14 @@ def map_grid_roi_to_cells(df_grid_roi, df_cells, overlapping=False):
 
     # Assign ROI ID and tissue coverage
     df_cells_mapped.loc[matched_mask, "roi_id"] = matched_roi_ids
-    df_cells_mapped.loc[matched_mask, "roi_tissue_coverage"] = (
-        cell_roi_tissue_coverage_arr[matched_mask]
-    )
+    df_cells_mapped.loc[matched_mask, "roi_tissue_coverage"] = cell_roi_tissue_coverage_arr[
+        matched_mask
+    ]
 
     # Assign DAPI data via direct array indexing (no dict lookups)
-    df_cells_mapped.loc[matched_mask, "DAPI_mean_roi"] = dapi_intensity_arr[
-        matched_df_indices
-    ]
-    df_cells_mapped.loc[matched_mask, "DAPI_RFS_roi"] = dapi_focus_arr[
-        matched_df_indices
-    ]
-    df_cells_mapped.loc[matched_mask, "DAPI_RFSnorm_roi"] = dapi_focus_norm_arr[
-        matched_df_indices
-    ]
+    df_cells_mapped.loc[matched_mask, "DAPI_mean_roi"] = dapi_intensity_arr[matched_df_indices]
+    df_cells_mapped.loc[matched_mask, "DAPI_RFS_roi"] = dapi_focus_arr[matched_df_indices]
+    df_cells_mapped.loc[matched_mask, "DAPI_RFSnorm_roi"] = dapi_focus_norm_arr[matched_df_indices]
 
     # Assign GMM classifications if available
     if has_gmm_1d:
@@ -9572,9 +9093,9 @@ def map_grid_roi_to_cells(df_grid_roi, df_cells, overlapping=False):
         df_cells_mapped.loc[matched_mask, "boundary_focus_score_roi"] = df_grid_roi[
             "boundary_focus_score"
         ].values[matched_df_indices]
-        df_cells_mapped.loc[matched_mask, "boundary_focus_score_norm_roi"] = (
-            df_grid_roi["boundary_focus_score_norm"].values[matched_df_indices]
-        )
+        df_cells_mapped.loc[matched_mask, "boundary_focus_score_norm_roi"] = df_grid_roi[
+            "boundary_focus_score_norm"
+        ].values[matched_df_indices]
         df_cells_mapped.loc[matched_mask, "boundary_intensity_roi"] = df_grid_roi[
             "boundary_intensity"
         ].values[matched_df_indices]
@@ -9593,9 +9114,7 @@ def map_grid_roi_to_cells(df_grid_roi, df_cells, overlapping=False):
     # Handle overlapping grids: if cell falls into multiple ROIs, use highest tissue_coverage
     if overlapping:
         # Find cells with multiple ROI assignments
-        cell_roi_counts = df_cells_mapped.groupby(df_cells_mapped.index)[
-            "roi_id"
-        ].count()
+        cell_roi_counts = df_cells_mapped.groupby(df_cells_mapped.index)["roi_id"].count()
         cells_with_multiple = cell_roi_counts[cell_roi_counts > 1].index
 
         if len(cells_with_multiple) > 0:
@@ -9614,9 +9133,7 @@ def map_grid_roi_to_cells(df_grid_roi, df_cells, overlapping=False):
 
                 if len(matching_rois) > 0:
                     # Select ROI with highest tissue_coverage
-                    best_roi = matching_rois.loc[
-                        matching_rois["tissue_coverage"].idxmax()
-                    ]
+                    best_roi = matching_rois.loc[matching_rois["tissue_coverage"].idxmax()]
 
                     # Update cell with best ROI
                     df_cells_mapped.loc[cell_idx, "roi_id"] = best_roi["roi_id"]
@@ -9636,42 +9153,42 @@ def map_grid_roi_to_cells(df_grid_roi, df_cells, overlapping=False):
 
                     # Update GMM classifications if available
                     if has_gmm_1d:
-                        df_cells_mapped.loc[cell_idx, "is_blurred_gmm_roi"] = (
-                            best_roi.get("is_blurred_gmm", False)
+                        df_cells_mapped.loc[cell_idx, "is_blurred_gmm_roi"] = best_roi.get(
+                            "is_blurred_gmm", False
                         )
                     if has_blur_prob_1d:
-                        df_cells_mapped.loc[cell_idx, "blur_prob_gmm_roi"] = (
-                            best_roi.get("blur_prob_gmm", np.nan)
+                        df_cells_mapped.loc[cell_idx, "blur_prob_gmm_roi"] = best_roi.get(
+                            "blur_prob_gmm", np.nan
                         )
                     if has_gmm_2d:
-                        df_cells_mapped.loc[cell_idx, "is_blurred_gmm_2d_roi"] = (
-                            best_roi.get("is_blurred_gmm_2d", False)
+                        df_cells_mapped.loc[cell_idx, "is_blurred_gmm_2d_roi"] = best_roi.get(
+                            "is_blurred_gmm_2d", False
                         )
                     if has_blur_prob_2d:
-                        df_cells_mapped.loc[cell_idx, "blur_prob_gmm_2d_roi"] = (
-                            best_roi.get("blur_prob_gmm_2d", np.nan)
+                        df_cells_mapped.loc[cell_idx, "blur_prob_gmm_2d_roi"] = best_roi.get(
+                            "blur_prob_gmm_2d", np.nan
                         )
 
                     if has_boundary:
-                        df_cells_mapped.loc[cell_idx, "boundary_focus_score_roi"] = (
-                            best_roi.get("boundary_focus_score", np.nan)
+                        df_cells_mapped.loc[cell_idx, "boundary_focus_score_roi"] = best_roi.get(
+                            "boundary_focus_score", np.nan
                         )
-                        df_cells_mapped.loc[
-                            cell_idx, "boundary_focus_score_norm_roi"
-                        ] = best_roi.get("boundary_focus_score_norm", np.nan)
-                        df_cells_mapped.loc[cell_idx, "boundary_intensity_roi"] = (
-                            best_roi.get("boundary_intensity", np.nan)
+                        df_cells_mapped.loc[cell_idx, "boundary_focus_score_norm_roi"] = (
+                            best_roi.get("boundary_focus_score_norm", np.nan)
+                        )
+                        df_cells_mapped.loc[cell_idx, "boundary_intensity_roi"] = best_roi.get(
+                            "boundary_intensity", np.nan
                         )
 
                     if has_intrna:
-                        df_cells_mapped.loc[cell_idx, "intrna_focus_score_roi"] = (
-                            best_roi.get("intrna_focus_score", np.nan)
+                        df_cells_mapped.loc[cell_idx, "intrna_focus_score_roi"] = best_roi.get(
+                            "intrna_focus_score", np.nan
                         )
-                        df_cells_mapped.loc[cell_idx, "intrna_focus_score_norm_roi"] = (
-                            best_roi.get("intrna_focus_score_norm", np.nan)
+                        df_cells_mapped.loc[cell_idx, "intrna_focus_score_norm_roi"] = best_roi.get(
+                            "intrna_focus_score_norm", np.nan
                         )
-                        df_cells_mapped.loc[cell_idx, "intrna_intensity_roi"] = (
-                            best_roi.get("intrna_intensity", np.nan)
+                        df_cells_mapped.loc[cell_idx, "intrna_intensity_roi"] = best_roi.get(
+                            "intrna_intensity", np.nan
                         )
 
     return df_cells_mapped
@@ -9696,7 +9213,7 @@ def load_roi_blur_threshold(outdir):
         return None, None
 
     try:
-        with open(threshold_json, "r") as f:
+        with open(threshold_json) as f:
             threshold_config = json.load(f)
         roi_threshold = threshold_config.get("roi_focus_score_threshold")
         intensity_threshold = threshold_config.get("roi_intensity_threshold")
@@ -9744,9 +9261,9 @@ def create_final_merged_data(
     new_df["join"] = 1
     new_df = new_df.merge(seg, on="join").drop("join", axis=1)
     seg.drop("join", axis=1, inplace=True)
-    new_df["match"] = new_df.apply(
-        lambda x: x.segmentation_method.find(x.segmentation), axis=1
-    ).ge(0)
+    new_df["match"] = new_df.apply(lambda x: x.segmentation_method.find(x.segmentation), axis=1).ge(
+        0
+    )
     new_df = new_df[new_df["match"]]
 
     # Add boolean columns for various thresholds (nuclei-based method)
@@ -9754,12 +9271,8 @@ def create_final_merged_data(
     new_df["is_high_nuclear_texture"] = new_df["CCFS_DAPI"] > ccfs_threshold
     new_df["is_near_edge"] = new_df["Distance-to-edge"] > edge_distance_threshold
     new_df["is_far_from_edge"] = new_df["Distance-to-edge"] <= edge_distance_threshold
-    new_df["is_near_hole"] = (
-        new_df["Distance-to-nearest-hole"] > hole_distance_threshold
-    )
-    new_df["is_far_from_hole"] = (
-        new_df["Distance-to-nearest-hole"] <= hole_distance_threshold
-    )
+    new_df["is_near_hole"] = new_df["Distance-to-nearest-hole"] > hole_distance_threshold
+    new_df["is_far_from_hole"] = new_df["Distance-to-nearest-hole"] <= hole_distance_threshold
     # Create boolean indicator for cells in any dense intensity region (backward compatibility)
     new_df["has_dense_intensity_regions"] = new_df["Dense-Intensity-Region-ID"] > 0
 
@@ -9767,9 +9280,7 @@ def create_final_merged_data(
     calculated_roi_threshold = None
     if roi_data is not None:
         # Merge ROI data using x and y coordinates
-        new_df = pd.merge(
-            new_df, roi_data, on=["x", "y"], how="left", suffixes=("", "_roi_merge")
-        )
+        new_df = pd.merge(new_df, roi_data, on=["x", "y"], how="left", suffixes=("", "_roi_merge"))
 
         # Use new threshold approach: raw score percentile + intensity threshold
         # If roi_threshold is provided (e.g., for backward compatibility), use it
@@ -9778,18 +9289,14 @@ def create_final_merged_data(
             # roi_threshold should have been calculated from df_grid_roi and passed here
             # If not provided, we can't calculate it here (need df_grid_roi)
             # This should not happen in normal flow, but provide fallback
-            logging.warning(
-                "  Warning: roi_threshold not provided, using default calculation"
-            )
+            logging.warning("  Warning: roi_threshold not provided, using default calculation")
             roi_threshold = -1.0  # Old default for backward compatibility
 
         # Use intensity threshold from configuration if not provided
         # If None, it means threshold config wasn't loaded (backward compatibility)
         # In that case, skip intensity check and only use focus score threshold
         if roi_intensity_threshold is None:
-            roi_intensity_threshold = (
-                None  # Will skip intensity check in classification
-            )
+            roi_intensity_threshold = None  # Will skip intensity check in classification
 
         calculated_roi_threshold = roi_threshold
 
@@ -9847,13 +9354,9 @@ def plot_nuclear_texture_proportions(
 
     # Calculate proportions
     proportions = (
-        df_temp.groupby([GROUP_BY_COLUMN, "texture_category"])
-        .size()
-        .unstack(fill_value=0)
+        df_temp.groupby([GROUP_BY_COLUMN, "texture_category"]).size().unstack(fill_value=0)
     )
-    proportions = (
-        proportions.div(proportions.sum(axis=1), axis=0) * 100
-    )  # Convert to percentages
+    proportions = proportions.div(proportions.sum(axis=1), axis=0) * 100  # Convert to percentages
 
     # Reorder so 'Low Quality' (red) is plotted first → at the bottom of
     # each stacked bar. Matches the convention in plot_tile_blur_proportions_roi
@@ -9900,16 +9403,12 @@ def plot_nuclear_texture_proportions(
     plt.tight_layout()
 
     # Save figure instead of showing
-    plt.savefig(
-        figures_dir / "nuclear_texture_proportions.png", dpi=300, bbox_inches="tight"
-    )
+    plt.savefig(figures_dir / "nuclear_texture_proportions.png", dpi=300, bbox_inches="tight")
     plt.close(fig)
 
     # Save data as CSV
     df_texture_proportions = (
-        df_temp.groupby([GROUP_BY_COLUMN, "texture_category"])
-        .size()
-        .reset_index(name="count")
+        df_temp.groupby([GROUP_BY_COLUMN, "texture_category"]).size().reset_index(name="count")
     )
     if figures_source_dir is not None:
         df_texture_proportions.to_csv(
@@ -9919,9 +9418,7 @@ def plot_nuclear_texture_proportions(
     # Print summary statistics
     logging.info("Summary statistics by cluster:")
     summary_stats = (
-        df_temp.groupby([GROUP_BY_COLUMN, "texture_category"])
-        .size()
-        .unstack(fill_value=0)
+        df_temp.groupby([GROUP_BY_COLUMN, "texture_category"]).size().unstack(fill_value=0)
     )
     logging.info("Count of cells by texture category:")
     logging.info(summary_stats)
@@ -9962,23 +9459,15 @@ def plot_tile_blur_proportions_roi(
 
     # Use GMM 2D if available, otherwise use threshold-based
     if has_gmm_2d:
-        df_temp["blur_category"] = np.where(
-            df_temp["is_blurred_gmm_2d_roi"], "Blurred", "In Focus"
-        )
+        df_temp["blur_category"] = np.where(df_temp["is_blurred_gmm_2d_roi"], "Blurred", "In Focus")
         method_name = "2D GMM"
     else:
-        df_temp["blur_category"] = np.where(
-            df_temp["is_blurred_roi"], "Blurred", "In Focus"
-        )
+        df_temp["blur_category"] = np.where(df_temp["is_blurred_roi"], "Blurred", "In Focus")
         method_name = "Threshold"
 
     # Calculate proportions
-    proportions = (
-        df_temp.groupby([GROUP_BY_COLUMN, "blur_category"]).size().unstack(fill_value=0)
-    )
-    proportions = (
-        proportions.div(proportions.sum(axis=1), axis=0) * 100
-    )  # Convert to percentages
+    proportions = df_temp.groupby([GROUP_BY_COLUMN, "blur_category"]).size().unstack(fill_value=0)
+    proportions = proportions.div(proportions.sum(axis=1), axis=0) * 100  # Convert to percentages
 
     # Set up the plot
     fig = plt.figure(figsize=(12, 6))
@@ -10030,16 +9519,12 @@ def plot_tile_blur_proportions_roi(
     plt.tight_layout()
 
     # Save figure instead of showing
-    plt.savefig(
-        figures_dir / "tile_blur_proportions_roi.png", dpi=300, bbox_inches="tight"
-    )
+    plt.savefig(figures_dir / "tile_blur_proportions_roi.png", dpi=300, bbox_inches="tight")
     plt.close(fig)
 
     # Save data as CSV
     df_blur_proportions = (
-        df_temp.groupby([GROUP_BY_COLUMN, "blur_category"])
-        .size()
-        .reset_index(name="count")
+        df_temp.groupby([GROUP_BY_COLUMN, "blur_category"]).size().reset_index(name="count")
     )
     if figures_source_dir is not None:
         df_blur_proportions.to_csv(
@@ -10048,9 +9533,7 @@ def plot_tile_blur_proportions_roi(
 
     # Print summary statistics
     logging.info(f"Summary statistics by cluster (tile-based, {method_name}):")
-    summary_stats = (
-        df_temp.groupby([GROUP_BY_COLUMN, "blur_category"]).size().unstack(fill_value=0)
-    )
+    summary_stats = df_temp.groupby([GROUP_BY_COLUMN, "blur_category"]).size().unstack(fill_value=0)
     logging.info("Count of cells by blur category:")
     logging.info(summary_stats)
     logging.info("Percentage of cells by blur category:")
@@ -10083,9 +9566,7 @@ def plot_cell_focus_distribution(
     has_gmm_class = "is_blurred_gmm_2d_roi" in new_df.columns
 
     if not has_focus:
-        logging.warning(
-            "No DAPI_RFSnorm_roi column — skipping cell focus distribution plot"
-        )
+        logging.warning("No DAPI_RFSnorm_roi column — skipping cell focus distribution plot")
         return
 
     fig, axes = plt.subplots(1, 2, figsize=(16, 6))
@@ -10098,7 +9579,9 @@ def plot_cell_focus_distribution(
     ax.set_xlabel("Tile focus score (DAPI_RFSnorm_roi)", fontsize=11)
     ax.set_ylabel("Number of cells", fontsize=11)
     ax.set_title("Overall histogram of tile focus scores across all cells", fontsize=12)
-    stats_text = f"n={len(focus_vals):,}\nMedian={focus_vals.median():.4f}\nMean={focus_vals.mean():.4f}"
+    stats_text = (
+        f"n={len(focus_vals):,}\nMedian={focus_vals.median():.4f}\nMean={focus_vals.mean():.4f}"
+    )
     ax.text(
         0.95,
         0.95,
@@ -10139,17 +9622,13 @@ def plot_cell_focus_distribution(
         )
     else:
         ax.hist(focus_vals, bins=60, alpha=0.7, color="steelblue")
-        ax.set_title(
-            "Histogram split by GMM blur classification (no GMM data)", fontsize=12
-        )
+        ax.set_title("Histogram split by GMM blur classification (no GMM data)", fontsize=12)
     ax.set_xlabel("Tile focus score (DAPI_RFSnorm_roi)", fontsize=11)
     ax.set_ylabel("Number of cells", fontsize=11)
     ax.grid(True, axis="y", linestyle="--", alpha=0.7)
 
     plt.tight_layout()
-    plt.savefig(
-        figures_dir / "cell_focus_distribution.png", dpi=300, bbox_inches="tight"
-    )
+    plt.savefig(figures_dir / "cell_focus_distribution.png", dpi=300, bbox_inches="tight")
     plt.close(fig)
 
     # Save source data
@@ -10160,9 +9639,7 @@ def plot_cell_focus_distribution(
         src_cols.append("blur_prob_gmm_2d_roi")
     if GROUP_BY_COLUMN in new_df.columns:
         src_cols.append(GROUP_BY_COLUMN)
-    src = new_df[[c for c in src_cols if c in new_df.columns]].dropna(
-        subset=["DAPI_RFSnorm_roi"]
-    )
+    src = new_df[[c for c in src_cols if c in new_df.columns]].dropna(subset=["DAPI_RFSnorm_roi"])
     if figures_source_dir is not None:
         src.to_csv(figures_source_dir / "cell_focus_distribution.csv", index=False)
 
@@ -10182,9 +9659,7 @@ def plot_tile_focus_gmm_spatial(new_df, figures_dir, figures_source_dir):
     has_gmm_2d = "is_blurred_gmm_2d_roi" in new_df.columns
     valid_mask = new_df["DAPI_RFSnorm_roi"].notna()
     if valid_mask.sum() == 0:
-        logging.warning(
-            "No valid DAPI_RFSnorm_roi values — skipping tile-focus GMM spatial plot"
-        )
+        logging.warning("No valid DAPI_RFSnorm_roi values — skipping tile-focus GMM spatial plot")
         return
 
     # Phase 11 (v5): aspect-adaptive figure size matching the slide proportions
@@ -10242,17 +9717,13 @@ def plot_tile_focus_gmm_spatial(new_df, figures_dir, figures_source_dir):
     ax.set_facecolor("black")
     ax.set_aspect("equal")
     plt.tight_layout()
-    plt.savefig(
-        figures_dir / "tile_focus_gmm_spatial.png", dpi=300, bbox_inches="tight"
-    )
+    plt.savefig(figures_dir / "tile_focus_gmm_spatial.png", dpi=300, bbox_inches="tight")
     plt.close(fig)
     # Save source data
     src_cols = ["x", "y", "DAPI_RFSnorm_roi"]
     if has_gmm_2d:
         src_cols.append("is_blurred_gmm_2d_roi")
-    src = new_df[[c for c in src_cols if c in new_df.columns]].dropna(
-        subset=["DAPI_RFSnorm_roi"]
-    )
+    src = new_df[[c for c in src_cols if c in new_df.columns]].dropna(subset=["DAPI_RFSnorm_roi"])
     if figures_source_dir is not None:
         src.to_csv(figures_source_dir / "tile_focus_gmm_spatial.csv", index=False)
 
@@ -10332,9 +9803,7 @@ def plot_cell_flagged_maps_combined(new_df, figures_dir, figures_source_dir):
                 # Same size as in-focus: GMM blur flags typically cover contiguous
                 # regions, so enlargement is not needed for visibility and would
                 # swamp the panel.
-                ax.scatter(
-                    _blurred["x"], -_blurred["y"], s=0.1, color="red", rasterized=True
-                )
+                ax.scatter(_blurred["x"], -_blurred["y"], s=0.1, color="red", rasterized=True)
     ax.set_title(
         "Spatial distribution of blurry cells\n(red = blurred, blue = in focus)",
         fontsize=14,
@@ -10402,9 +9871,7 @@ def plot_blur_prob_density_by_cluster(
             if legend is not None:
                 handles = legend.legend_handles
                 labels = [f"Cluster {label.get_text()}" for label in legend.get_texts()]
-                threshold_line = plt.Line2D(
-                    [0], [0], color="black", linestyle="--", alpha=0.5
-                )
+                threshold_line = plt.Line2D([0], [0], color="black", linestyle="--", alpha=0.5)
                 handles = [threshold_line] + handles
                 labels = ["Blur threshold (0.5)"] + labels
                 plt.legend(
@@ -10423,9 +9890,7 @@ def plot_blur_prob_density_by_cluster(
         ax = plt.gca()
         new_df["blur_prob_gmm_2d_roi"].dropna().plot.kde(ax=ax, color="steelblue")
         plt.axvline(x=0.5, color="black", linestyle="--", alpha=0.5)
-        plt.title(
-            "GMM blur probability density (threshold at 0.5)", fontsize=14, pad=20
-        )
+        plt.title("GMM blur probability density (threshold at 0.5)", fontsize=14, pad=20)
     plt.xlabel("P(blur component)", fontsize=12)
     plt.ylabel("Density", fontsize=12)
     plt.grid(True, linestyle="--", alpha=0.7)
@@ -10617,17 +10082,13 @@ def plot_nuclear_texture_density(
     plt.tight_layout()
 
     # Save figure instead of showing
-    plt.savefig(
-        figures_dir / "nuclear_texture_density.png", dpi=300, bbox_inches="tight"
-    )
+    plt.savefig(figures_dir / "nuclear_texture_density.png", dpi=300, bbox_inches="tight")
     plt.close(fig)
 
     # Save data as CSV
     if figures_source_dir is not None:
         df_density_data = new_df[["CCFS_DAPI", GROUP_BY_COLUMN]].copy()
-        df_density_data.to_csv(
-            figures_source_dir / "nuclear_texture_density.csv", index=False
-        )
+        df_density_data.to_csv(figures_source_dir / "nuclear_texture_density.csv", index=False)
 
 
 def plot_nuclear_texture_vs_transcripts(
@@ -10887,9 +10348,7 @@ def plot_per_cell_intensity_vs_transcripts(
             plt.xscale("log")
             plt.yscale("log")
             plt.xlabel("Transcript counts (log scale)", fontsize=12)
-            plt.ylabel(
-                f"{ch_label} mean intensity (16-bit counts, log scale)", fontsize=12
-            )
+            plt.ylabel(f"{ch_label} mean intensity (16-bit counts, log scale)", fontsize=12)
 
         plt.grid(True, linestyle="--", alpha=0.7)
         plt.tight_layout()
@@ -10903,8 +10362,7 @@ def plot_per_cell_intensity_vs_transcripts(
             _valid.to_csv(figures_source_dir / f"{fname}.csv", index=False)
 
         logging.info(
-            f"Saved {fname}.png (n={len(_valid):,}, "
-            f"median intensity={_valid[col].median():.0f})"
+            f"Saved {fname}.png (n={len(_valid):,}, median intensity={_valid[col].median():.0f})"
         )
 
 
@@ -10931,9 +10389,7 @@ def plot_gmm_focus_vs_transcripts(
         )
         return
 
-    df = new_df[
-        [tx_col, focus_col] + ([gmm_col] if gmm_col in new_df.columns else [])
-    ].dropna()
+    df = new_df[[tx_col, focus_col] + ([gmm_col] if gmm_col in new_df.columns else [])].dropna()
     if df.empty:
         return
 
@@ -10973,9 +10429,7 @@ def plot_gmm_focus_vs_transcripts(
     ax.grid(True, linestyle="--", alpha=0.7)
 
     plt.tight_layout()
-    plt.savefig(
-        figures_dir / "gmm_focus_vs_transcripts.png", dpi=300, bbox_inches="tight"
-    )
+    plt.savefig(figures_dir / "gmm_focus_vs_transcripts.png", dpi=300, bbox_inches="tight")
     plt.close(fig)
 
     # Save source data
@@ -10983,9 +10437,7 @@ def plot_gmm_focus_vs_transcripts(
         src_cols = [tx_col, focus_col]
         if has_gmm:
             src_cols.append(gmm_col)
-        df[src_cols].to_csv(
-            figures_source_dir / "gmm_focus_vs_transcripts.csv", index=False
-        )
+        df[src_cols].to_csv(figures_source_dir / "gmm_focus_vs_transcripts.csv", index=False)
 
     logging.info("GMM focus vs transcripts: %d cells plotted.", len(df))
 
@@ -11049,9 +10501,7 @@ def plot_ccfs_vs_roi_comparison(new_df, figures_dir, figures_source_dir):
     ax.grid(True, linestyle="--", alpha=0.7)
 
     # Add correlation coefficient (Spearman rank-based correlation)
-    correlation = new_df["CCFS_DAPI"].corr(
-        new_df["DAPI_RFSnorm_roi"], method="spearman"
-    )
+    correlation = new_df["CCFS_DAPI"].corr(new_df["DAPI_RFSnorm_roi"], method="spearman")
     ax.text(
         0.05,
         0.95,
@@ -11162,9 +10612,7 @@ def plot_ccfs_vs_roi_comparison(new_df, figures_dir, figures_source_dir):
         )
         ax.set_xlabel("CCFS_DAPI (Nuclei-based)", fontsize=12)
         ax.set_ylabel("DAPI_RFSnorm_roi (Cell-Independent Tile-based)", fontsize=12)
-        ax.set_title(
-            f"Classification Agreement (CCFS vs Tile-based {method_label})", fontsize=14
-        )
+        ax.set_title(f"Classification Agreement (CCFS vs Tile-based {method_label})", fontsize=14)
         ax.legend(fontsize=10)
         ax.grid(True, linestyle="--", alpha=0.7)
 
@@ -11205,21 +10653,15 @@ def plot_ccfs_vs_roi_comparison(new_df, figures_dir, figures_source_dir):
     ax.grid(True, linestyle="--", alpha=0.7)
 
     plt.tight_layout()
-    plt.savefig(
-        figures_dir / "ccfs_vs_roi_comparison.pdf", dpi=300, bbox_inches="tight"
-    )
-    plt.savefig(
-        figures_dir / "ccfs_vs_roi_comparison.png", dpi=300, bbox_inches="tight"
-    )
+    plt.savefig(figures_dir / "ccfs_vs_roi_comparison.pdf", dpi=300, bbox_inches="tight")
+    plt.savefig(figures_dir / "ccfs_vs_roi_comparison.png", dpi=300, bbox_inches="tight")
     plt.close(fig)
 
     # Save data as CSV (including ranks)
     df_comparison = new_df[["CCFS_DAPI", "DAPI_RFS_roi", "DAPI_RFSnorm_roi"]].copy()
     # Add ranks for analysis
     df_comparison["CCFS_DAPI_rank"] = new_df["CCFS_DAPI"].rank(method="average")
-    df_comparison["DAPI_RFSnorm_roi_rank"] = new_df["DAPI_RFSnorm_roi"].rank(
-        method="average"
-    )
+    df_comparison["DAPI_RFSnorm_roi_rank"] = new_df["DAPI_RFSnorm_roi"].rank(method="average")
 
     # Add classification columns - prefer GMM 2D, include threshold-based if available
     if "is_low_nuclear_texture" in new_df.columns:
@@ -11242,9 +10684,7 @@ def plot_ccfs_vs_roi_comparison(new_df, figures_dir, figures_source_dir):
             )
 
     if figures_source_dir is not None:
-        df_comparison.to_csv(
-            figures_source_dir / "ccfs_vs_roi_comparison.csv", index=False
-        )
+        df_comparison.to_csv(figures_source_dir / "ccfs_vs_roi_comparison.csv", index=False)
 
 
 def plot_spatial_comparison(new_df, myData, figures_dir, figures_source_dir):
@@ -11336,9 +10776,7 @@ def plot_spatial_comparison(new_df, myData, figures_dir, figures_source_dir):
                     alpha=0.5,
                     rasterized=True,
                 )
-                ax.set_title(
-                    "Tile-based Focus Score (GMM 2D Classification)", fontsize=14
-                )
+                ax.set_title("Tile-based Focus Score (GMM 2D Classification)", fontsize=14)
                 # Add legend
                 from matplotlib.patches import Patch
 
@@ -11445,18 +10883,14 @@ def save_cell_qc_metrics(new_df, outdir, roi_size=None):
         "cells_low_nuclear_texture": len(new_df[new_df["is_low_nuclear_texture"]]),
         "cells_near_edge": len(new_df[new_df["is_near_edge"]]),
         "cells_near_holes": len(new_df[new_df["is_near_hole"]]),
-        "cells_with_dense_intensity_regions": len(
-            new_df[new_df["has_dense_intensity_regions"]]
-        ),
+        "cells_with_dense_intensity_regions": len(new_df[new_df["has_dense_intensity_regions"]]),
         "unique_dense_intensity_regions": sorted(
             new_df["Dense-Intensity-Region-ID"].unique().tolist()
         )
         if "Dense-Intensity-Region-ID" in new_df.columns
         else [],
         "total_dense_intensity_regions": len(
-            new_df[new_df["Dense-Intensity-Region-ID"] > 0][
-                "Dense-Intensity-Region-ID"
-            ].unique()
+            new_df[new_df["Dense-Intensity-Region-ID"] > 0]["Dense-Intensity-Region-ID"].unique()
         )
         if "Dense-Intensity-Region-ID" in new_df.columns
         else 0,
@@ -11472,40 +10906,30 @@ def save_cell_qc_metrics(new_df, outdir, roi_size=None):
         qc_metrics["mean_dapi_rfs_roi"] = float(new_df["DAPI_RFS_roi"].mean())
         qc_metrics["median_dapi_rfs_roi"] = float(new_df["DAPI_RFS_roi"].median())
         qc_metrics["mean_dapi_rfsnorm_roi"] = float(new_df["DAPI_RFSnorm_roi"].mean())
-        qc_metrics["median_dapi_rfsnorm_roi"] = float(
-            new_df["DAPI_RFSnorm_roi"].median()
-        )
+        qc_metrics["median_dapi_rfsnorm_roi"] = float(new_df["DAPI_RFSnorm_roi"].median())
 
         # GMM 2D metrics (preferred method)
         if "is_blurred_gmm_2d_roi" in new_df.columns:
             qc_metrics["cells_high_focus_gmm_2d_roi"] = len(
                 new_df[~new_df["is_blurred_gmm_2d_roi"]]
             )
-            qc_metrics["cells_blurred_gmm_2d_roi"] = len(
-                new_df[new_df["is_blurred_gmm_2d_roi"]]
-            )
+            qc_metrics["cells_blurred_gmm_2d_roi"] = len(new_df[new_df["is_blurred_gmm_2d_roi"]])
             if "blur_prob_gmm_2d_roi" in new_df.columns:
                 valid_probs = new_df["blur_prob_gmm_2d_roi"].dropna()
                 if len(valid_probs) > 0:
                     qc_metrics["mean_blur_prob_gmm_2d_roi"] = float(valid_probs.mean())
-                    qc_metrics["median_blur_prob_gmm_2d_roi"] = float(
-                        valid_probs.median()
-                    )
+                    qc_metrics["median_blur_prob_gmm_2d_roi"] = float(valid_probs.median())
 
         # Threshold-based metrics (for comparison/backward compatibility)
         if "is_blurred_roi" in new_df.columns:
-            qc_metrics["cells_high_focus_roi"] = len(
-                new_df[new_df["is_high_focus_roi"]]
-            )
+            qc_metrics["cells_high_focus_roi"] = len(new_df[new_df["is_high_focus_roi"]])
             qc_metrics["cells_blurred_roi"] = len(new_df[new_df["is_blurred_roi"]])
 
         # Comparison metrics between nuclei-based and tile-based methods
         # Calculate Spearman rank-based correlation between CCFS_DAPI and DAPI_RFSnorm_roi
         # Spearman is better suited for different scales and non-linear relationships
         if "CCFS_DAPI" in new_df.columns and "DAPI_RFSnorm_roi" in new_df.columns:
-            correlation = new_df["CCFS_DAPI"].corr(
-                new_df["DAPI_RFSnorm_roi"], method="spearman"
-            )
+            correlation = new_df["CCFS_DAPI"].corr(new_df["DAPI_RFSnorm_roi"], method="spearman")
             qc_metrics["ccfs_vs_rfs_correlation"] = (
                 float(correlation) if not np.isnan(correlation) else None
             )
@@ -11516,31 +10940,22 @@ def save_cell_qc_metrics(new_df, outdir, roi_size=None):
                 # GMM 2D agreement (preferred)
                 if "is_blurred_gmm_2d_roi" in new_df.columns:
                     agreement_gmm_2d = (
-                        new_df["is_low_nuclear_texture"]
-                        == new_df["is_blurred_gmm_2d_roi"]
+                        new_df["is_low_nuclear_texture"] == new_df["is_blurred_gmm_2d_roi"]
                     ).sum()
                     agreement_rate_gmm_2d = agreement_gmm_2d / len(new_df)
-                    qc_metrics["classification_agreement_gmm_2d"] = float(
-                        agreement_rate_gmm_2d
-                    )
-                    qc_metrics["classification_agreement_gmm_2d_count"] = int(
-                        agreement_gmm_2d
-                    )
+                    qc_metrics["classification_agreement_gmm_2d"] = float(agreement_rate_gmm_2d)
+                    qc_metrics["classification_agreement_gmm_2d_count"] = int(agreement_gmm_2d)
                     qc_metrics["classification_disagreement_gmm_2d_count"] = int(
                         len(new_df) - agreement_gmm_2d
                     )
 
                 # Threshold-based agreement (for comparison)
                 if "is_blurred_roi" in new_df.columns:
-                    agreement = (
-                        new_df["is_low_nuclear_texture"] == new_df["is_blurred_roi"]
-                    ).sum()
+                    agreement = (new_df["is_low_nuclear_texture"] == new_df["is_blurred_roi"]).sum()
                     agreement_rate = agreement / len(new_df)
                     qc_metrics["classification_agreement"] = float(agreement_rate)
                     qc_metrics["classification_agreement_count"] = int(agreement)
-                    qc_metrics["classification_disagreement_count"] = int(
-                        len(new_df) - agreement
-                    )
+                    qc_metrics["classification_disagreement_count"] = int(len(new_df) - agreement)
 
     # Save metrics
     with open(outdir / "image_qc_cell_metrics.json", "w") as f:
@@ -11556,12 +10971,8 @@ def save_cell_qc_metrics(new_df, outdir, roi_size=None):
     logging.info(f"Cells with transcripts: {qc_metrics['cells_with_transcripts']:,}")
     logging.info(f"Mean transcript count: {qc_metrics['mean_transcript_count']:.1f}")
     logging.info(f"Mean CCFS DAPI: {qc_metrics['mean_ccfs_dapi']:.6f}")
-    logging.info(
-        f"Cells high nuclear texture: {qc_metrics['cells_high_nuclear_texture']:,}"
-    )
-    logging.info(
-        f"Cells low nuclear texture: {qc_metrics['cells_low_nuclear_texture']:,}"
-    )
+    logging.info(f"Cells high nuclear texture: {qc_metrics['cells_high_nuclear_texture']:,}")
+    logging.info(f"Cells low nuclear texture: {qc_metrics['cells_low_nuclear_texture']:,}")
     logging.info(f"Cells near edge: {qc_metrics['cells_near_edge']:,}")
     logging.info(f"Cells near holes: {qc_metrics['cells_near_holes']:,}")
     logging.info(
@@ -11584,9 +10995,7 @@ def save_cell_qc_metrics(new_df, outdir, roi_size=None):
     if "mean_dapi_rfs_roi" in qc_metrics:
         logging.info("\n=== TILE-BASED FOCUS SCORE SUMMARY ===")
         logging.info(f"Mean DAPI RFS (tile): {qc_metrics['mean_dapi_rfs_roi']:.6f}")
-        logging.info(
-            f"Mean DAPI RFS normalized (tile): {qc_metrics['mean_dapi_rfsnorm_roi']:.6f}"
-        )
+        logging.info(f"Mean DAPI RFS normalized (tile): {qc_metrics['mean_dapi_rfsnorm_roi']:.6f}")
 
         # GMM 2D metrics (preferred)
         if "cells_blurred_gmm_2d_roi" in qc_metrics:
@@ -11594,9 +11003,7 @@ def save_cell_qc_metrics(new_df, outdir, roi_size=None):
             logging.info(
                 f"Cells with high focus (2D GMM): {qc_metrics['cells_high_focus_gmm_2d_roi']:,}"
             )
-            logging.info(
-                f"Cells blurred (2D GMM): {qc_metrics['cells_blurred_gmm_2d_roi']:,}"
-            )
+            logging.info(f"Cells blurred (2D GMM): {qc_metrics['cells_blurred_gmm_2d_roi']:,}")
             if "mean_blur_prob_gmm_2d_roi" in qc_metrics:
                 logging.info(
                     f"Mean blur probability (2D GMM): {qc_metrics['mean_blur_prob_gmm_2d_roi']:.4f}"
@@ -11608,9 +11015,7 @@ def save_cell_qc_metrics(new_df, outdir, roi_size=None):
             logging.info(
                 f"Cells with high focus (Threshold): {qc_metrics['cells_high_focus_roi']:,}"
             )
-            logging.info(
-                f"Cells blurred (Threshold): {qc_metrics['cells_blurred_roi']:,}"
-            )
+            logging.info(f"Cells blurred (Threshold): {qc_metrics['cells_blurred_roi']:,}")
 
         if (
             "ccfs_vs_rfs_correlation" in qc_metrics
@@ -11693,10 +11098,7 @@ def generate_cell_figures(
         )
 
     def _plot2_blur_proportions_roi():
-        if (
-            "is_blurred_gmm_2d_roi" in new_df.columns
-            or "is_blurred_roi" in new_df.columns
-        ):
+        if "is_blurred_gmm_2d_roi" in new_df.columns or "is_blurred_roi" in new_df.columns:
             logging.info("  - Blur score proportions (tile-based)...")
             roi_threshold_display = roi_threshold if roi_threshold is not None else -1.0
             plot_tile_blur_proportions_roi._intensity_threshold = (
@@ -11752,9 +11154,7 @@ def generate_cell_figures(
         plot_intensity_transcript_correlation(new_df, figures_dir, figures_source_dir)
 
     def _plot12_per_cell_intensity_vs_transcripts():
-        logging.info(
-            "  - Per-cell intensity vs transcripts (DAPI / Boundary / IntRNA)..."
-        )
+        logging.info("  - Per-cell intensity vs transcripts (DAPI / Boundary / IntRNA)...")
         plot_per_cell_intensity_vs_transcripts(
             new_df, figures_dir, figures_source_dir, log_scale=True
         )
@@ -11802,9 +11202,7 @@ def generate_all_figures(
 ):
     """Generate ALL 13 Quarto-required figures using multithreading, and save the data used for each plot as CSV."""
     figures_dir = data["figures_dir"]
-    figures_source_dir = (
-        (figures_dir / "figures_source") if figure_source_tables else None
-    )
+    figures_source_dir = (figures_dir / "figures_source") if figure_source_tables else None
     if figures_source_dir is not None:
         figures_source_dir.mkdir(parents=True, exist_ok=True)
     # if df_spatial['In-Area-with-Artefact'] have a single unique value, use that value, otherwise use 0.5
@@ -11822,9 +11220,7 @@ def generate_all_figures(
         distance_map = multistain_distance_map
     if multistain_distance_map2 is not None:
         distance_map2 = multistain_distance_map2
-    _dm_mask = (
-        whole_sample if multistain_whole_sample is None else multistain_whole_sample
-    )
+    _dm_mask = whole_sample if multistain_whole_sample is None else multistain_whole_sample
 
     def _fig1_distance_edge():
         logging.info("Generating Figure 1: Distance map (edge)...")
@@ -11854,14 +11250,10 @@ def generate_all_figures(
         if _dm_mask.shape == distance_map.shape:
             _dist_um = np.abs(distance_map) * 8 * 0.2125
             _dm_edge = np.where(_dm_mask > 0, _dist_um, np.nan)
-            im = _imshow_thumb(
-                ax, _dm_edge, cmap=_cmap_edge, vmin=0.0, vmax=_EDGE_VMAX_UM
-            )
+            im = _imshow_thumb(ax, _dm_edge, cmap=_cmap_edge, vmin=0.0, vmax=_EDGE_VMAX_UM)
             _edge_cbar_extend = "max"
         else:
-            _dm_edge = (
-                distance_map  # fallback: shapes mismatch, preserve prior behaviour
-            )
+            _dm_edge = distance_map  # fallback: shapes mismatch, preserve prior behaviour
             im = _imshow_thumb(ax, _dm_edge, cmap=_cmap_edge)
             _edge_cbar_extend = "neither"
         if _dm_mask.shape == distance_map.shape:
@@ -11881,9 +11273,7 @@ def generate_all_figures(
         # Explicit "300+" label at the cap when extend="max" is active
         if _edge_cbar_extend == "max":
             cbar.set_ticks([0, 50, 100, 150, 200, 250, _EDGE_VMAX_UM])
-            cbar.set_ticklabels(
-                ["0", "50", "100", "150", "200", "250", f"{int(_EDGE_VMAX_UM)}+"]
-            )
+            cbar.set_ticklabels(["0", "50", "100", "150", "200", "250", f"{int(_EDGE_VMAX_UM)}+"])
         plt.tight_layout()
         plt.savefig(figures_dir / "distance_map_edge.pdf", dpi=300, bbox_inches="tight")
         plt.savefig(figures_dir / "distance_map_edge.png", dpi=300, bbox_inches="tight")
@@ -11923,9 +11313,7 @@ def generate_all_figures(
         if _dm_mask.shape == distance_map2.shape:
             _dist_um_h = np.abs(distance_map2) * 8 * 0.2125
             _dm_holes = np.where(_dm_mask > 0, _dist_um_h, np.nan)
-            im = _imshow_thumb(
-                ax, _dm_holes, cmap=_cmap_holes, vmin=0.0, vmax=_HOLES_VMAX_UM
-            )
+            im = _imshow_thumb(ax, _dm_holes, cmap=_cmap_holes, vmin=0.0, vmax=_HOLES_VMAX_UM)
             _holes_cbar_extend = "max"
         else:
             _dm_holes = distance_map2  # fallback: shapes mismatch
@@ -11948,16 +11336,10 @@ def generate_all_figures(
         # Explicit "300+" label at the cap when extend="max" is active.
         if _holes_cbar_extend == "max":
             cbar.set_ticks([0, 50, 100, 150, 200, 250, _HOLES_VMAX_UM])
-            cbar.set_ticklabels(
-                ["0", "50", "100", "150", "200", "250", f"{int(_HOLES_VMAX_UM)}+"]
-            )
+            cbar.set_ticklabels(["0", "50", "100", "150", "200", "250", f"{int(_HOLES_VMAX_UM)}+"])
         plt.tight_layout()
-        plt.savefig(
-            figures_dir / "distance_map_holes.pdf", dpi=300, bbox_inches="tight"
-        )
-        plt.savefig(
-            figures_dir / "distance_map_holes.png", dpi=300, bbox_inches="tight"
-        )
+        plt.savefig(figures_dir / "distance_map_holes.pdf", dpi=300, bbox_inches="tight")
+        plt.savefig(figures_dir / "distance_map_holes.png", dpi=300, bbox_inches="tight")
         plt.close(fig)
         # Full-resolution export (see distance_map_edge.csv note): gated behind
         # --figure-source-tables (off by default); rendering uses the display-res thumbnail.
@@ -12013,9 +11395,7 @@ def generate_all_figures(
         cbar_e.set_label("Distance from edge (µm)")
         if _edge_extend == "max":
             cbar_e.set_ticks([0, 50, 100, 150, 200, 250, _VMAX_UM])
-            cbar_e.set_ticklabels(
-                ["0", "50", "100", "150", "200", "250", f"{int(_VMAX_UM)}+"]
-            )
+            cbar_e.set_ticklabels(["0", "50", "100", "150", "200", "250", f"{int(_VMAX_UM)}+"])
 
         # ── Right panel: distance to holes ─────────────────────────────
         ax = axes[1]
@@ -12042,9 +11422,7 @@ def generate_all_figures(
         cbar_h.set_label("Distance from nearest hole (µm)")
         if _holes_extend == "max":
             cbar_h.set_ticks([0, 50, 100, 150, 200, 250, _VMAX_UM])
-            cbar_h.set_ticklabels(
-                ["0", "50", "100", "150", "200", "250", f"{int(_VMAX_UM)}+"]
-            )
+            cbar_h.set_ticklabels(["0", "50", "100", "150", "200", "250", f"{int(_VMAX_UM)}+"])
 
         plt.tight_layout()
         plt.savefig(figures_dir / "distance_maps.png", dpi=300, bbox_inches="tight")
@@ -12074,12 +11452,8 @@ def generate_all_figures(
         ax[2].set_aspect("equal")
         ax[2].axis("off")
         plt.tight_layout()
-        plt.savefig(
-            figures_dir / "morphology_overview.pdf", dpi=300, bbox_inches="tight"
-        )
-        plt.savefig(
-            figures_dir / "morphology_overview.png", dpi=300, bbox_inches="tight"
-        )
+        plt.savefig(figures_dir / "morphology_overview.pdf", dpi=300, bbox_inches="tight")
+        plt.savefig(figures_dir / "morphology_overview.png", dpi=300, bbox_inches="tight")
         plt.close(fig)
         # Full-resolution export (see distance_map_edge.csv note): four ~86-Mpx channel
         # grids, gated behind --figure-source-tables (off by default); rendering uses
@@ -12161,9 +11535,7 @@ def generate_all_figures(
             }
         )
         if figures_source_dir is not None:
-            df_sample_qc_metrics.to_csv(
-                figures_source_dir / "sample_qc_metrics.csv", index=False
-            )
+            df_sample_qc_metrics.to_csv(figures_source_dir / "sample_qc_metrics.csv", index=False)
 
     def _fig5_imageqc_masks():
         logging.info("Generating Figure 5: ImageQC masks...")
@@ -12175,9 +11547,7 @@ def generate_all_figures(
         # §2.3 tissue mask shows the EXTENT mask (all available stains) so it matches the
         # reported tissue coverage; falls back to the DAPI mask on single-stain slides.
         _extent_ws = (
-            multistain_whole_sample
-            if multistain_whole_sample is not None
-            else whole_sample
+            multistain_whole_sample if multistain_whole_sample is not None else whole_sample
         )
         fig, ax = plt.subplots(1, 3, figsize=(3 * _panel_width, _panel_height))
         ax[0].set_title("Tissue mask (all stains)", fontsize=14)
@@ -12305,9 +11675,7 @@ def generate_all_figures(
             }
         )
         if figures_source_dir is not None:
-            df_ccfs_thresholded.to_csv(
-                figures_source_dir / "ccfs_thresholded.csv", index=False
-            )
+            df_ccfs_thresholded.to_csv(figures_source_dir / "ccfs_thresholded.csv", index=False)
 
     def _fig8_umap_multiple_metrics():
         logging.info("Generating Figure 8: UMAP by multiple metrics...")
@@ -12359,9 +11727,7 @@ def generate_all_figures(
         ax[1, 1].set_facecolor("black")
         ax[1, 1].set_aspect("equal")
         plt.tight_layout()
-        plt.savefig(
-            figures_dir / "umap_multiple_metrics.png", dpi=300, bbox_inches="tight"
-        )
+        plt.savefig(figures_dir / "umap_multiple_metrics.png", dpi=300, bbox_inches="tight")
         plt.close(fig)
         df_umap_multiple_metrics = new_df[
             [
@@ -12432,9 +11798,7 @@ def generate_all_figures(
         ax[1, 1].set_facecolor("black")
         ax[1, 1].set_aspect("equal")
         plt.tight_layout()
-        plt.savefig(
-            figures_dir / "umap_distance_metrics.png", dpi=300, bbox_inches="tight"
-        )
+        plt.savefig(figures_dir / "umap_distance_metrics.png", dpi=300, bbox_inches="tight")
         plt.close(fig)
         df_umap_distance_metrics = new_df[
             [
@@ -12459,21 +11823,13 @@ def generate_all_figures(
         highH = new_df[new_df["is_far_from_hole"]]
         lowH = new_df[new_df["is_near_hole"]]
         fig, ax = plt.subplots(2, 2, figsize=(15, 15))
-        ax[0, 0].scatter(
-            highE["UMAP-1"], highE["UMAP-2"], s=0.1, color="#1B2631", rasterized=True
-        )
-        ax[0, 0].scatter(
-            lowE["UMAP-1"], lowE["UMAP-2"], s=0.1, color="red", rasterized=True
-        )
+        ax[0, 0].scatter(highE["UMAP-1"], highE["UMAP-2"], s=0.1, color="#1B2631", rasterized=True)
+        ax[0, 0].scatter(lowE["UMAP-1"], lowE["UMAP-2"], s=0.1, color="red", rasterized=True)
         ax[0, 0].set_title("UMAP by Distance to edge")
         ax[0, 0].set_facecolor("black")
         ax[0, 0].set_aspect("equal")
-        ax[0, 1].scatter(
-            highH["UMAP-1"], highH["UMAP-2"], s=0.1, color="#1B2631", rasterized=True
-        )
-        ax[0, 1].scatter(
-            lowH["UMAP-1"], lowH["UMAP-2"], s=0.1, color="red", rasterized=True
-        )
+        ax[0, 1].scatter(highH["UMAP-1"], highH["UMAP-2"], s=0.1, color="#1B2631", rasterized=True)
+        ax[0, 1].scatter(lowH["UMAP-1"], lowH["UMAP-2"], s=0.1, color="red", rasterized=True)
         ax[0, 1].set_title("UMAP by Distance to nearest hole")
         ax[0, 1].set_facecolor("black")
         ax[0, 1].set_aspect("equal")
@@ -12508,9 +11864,7 @@ def generate_all_figures(
         ax[1, 1].set_facecolor("black")
         ax[1, 1].set_aspect("equal")
         plt.tight_layout()
-        plt.savefig(
-            figures_dir / "umap_thresholded_metrics.png", dpi=300, bbox_inches="tight"
-        )
+        plt.savefig(figures_dir / "umap_thresholded_metrics.png", dpi=300, bbox_inches="tight")
         plt.close(fig)
         # Save data as CSV
         df_umap_thresholded_metrics = new_df[
@@ -12552,9 +11906,7 @@ def generate_all_figures(
         )
 
     def _fig13_nuclear_texture_vs_transcripts():
-        logging.info(
-            "Generating Figure 13: Nuclear Texture vs Transcripts (Log Scale)..."
-        )
+        logging.info("Generating Figure 13: Nuclear Texture vs Transcripts (Log Scale)...")
         plot_nuclear_texture_vs_transcripts(
             new_df,
             figures_dir,
@@ -12568,10 +11920,7 @@ def generate_all_figures(
         plot_cell_focus_distribution(new_df, figures_dir, figures_source_dir)
 
     def _fig15_gmm_blur_proportions_by_cluster():
-        if (
-            "is_blurred_gmm_2d_roi" in new_df.columns
-            or "is_blurred_roi" in new_df.columns
-        ):
+        if "is_blurred_gmm_2d_roi" in new_df.columns or "is_blurred_roi" in new_df.columns:
             logging.info("Generating Figure 15: GMM Blur Proportions by Cluster...")
             plot_tile_blur_proportions_roi(
                 new_df,
@@ -12597,9 +11946,7 @@ def generate_all_figures(
         plot_blur_prob_density_by_cluster(new_df, figures_dir, figures_source_dir)
 
     def _fig19_intensity_transcript_correlation():
-        logging.info(
-            "Generating Figure 19: Intensity-transcript correlation heatmap..."
-        )
+        logging.info("Generating Figure 19: Intensity-transcript correlation heatmap...")
         plot_intensity_transcript_correlation(new_df, figures_dir, figures_source_dir)
 
     def _fig20_per_cell_intensity_vs_transcripts():
@@ -12675,12 +12022,8 @@ def save_simple_qc_metrics(new_df, outdir):
     logging.info(f"Cells with transcripts: {qc_metrics['cells_with_transcripts']:,}")
     logging.info(f"Mean transcript count: {qc_metrics['mean_transcript_count']:.1f}")
     logging.info(f"Mean CCFS DAPI: {qc_metrics['mean_ccfs_dapi']:.6f}")
-    logging.info(
-        f"Cells high nuclear texture: {qc_metrics['cells_high_nuclear_texture']:,}"
-    )
-    logging.info(
-        f"Cells low nuclear texture: {qc_metrics['cells_low_nuclear_texture']:,}"
-    )
+    logging.info(f"Cells high nuclear texture: {qc_metrics['cells_high_nuclear_texture']:,}")
+    logging.info(f"Cells low nuclear texture: {qc_metrics['cells_low_nuclear_texture']:,}")
     logging.info(f"Cells near edge: {qc_metrics['cells_near_edge']:,}")
     logging.info(f"Cells near holes: {qc_metrics['cells_near_holes']:,}")
     logging.info(f"Cells with artifacts: {qc_metrics['cells_with_artifacts']:,}")
@@ -12809,9 +12152,7 @@ def calculate_ccfs_from_focus_maps(
         focus_map = focus_maps.get("dapi_focus_map")
         mean_map = focus_maps.get("dapi_mean_map")
         if focus_map is None or mean_map is None:
-            raise ValueError(
-                "focus_maps must contain 'dapi_focus_map' and 'dapi_mean_map'"
-            )
+            raise ValueError("focus_maps must contain 'dapi_focus_map' and 'dapi_mean_map'")
     elif not streamed.has_per_cell:
         raise ValueError(
             "streamed results carry no per-cell reduction; "
@@ -12837,9 +12178,7 @@ def calculate_ccfs_from_focus_maps(
         }
     else:
         nuclear_mask = cell_masks_zarr.get("masks").get("0")
-        logging.info(
-            "  Aggregating focus/intensity over nuclear masks (row-blocked)..."
-        )
+        logging.info("  Aggregating focus/intensity over nuclear masks (row-blocked)...")
         t0 = time.time()
         nuc_counts, nuc_sums = _labeled_sums_chunked(
             nuclear_mask,
@@ -12902,9 +12241,7 @@ def calculate_ccfs_from_focus_maps(
         if intrna_mean is not None:
             cell_value_planes["intrna"] = intrna_mean
 
-        logging.info(
-            "  Aggregating cell areas/intensities over cell masks (row-blocked)..."
-        )
+        logging.info("  Aggregating cell areas/intensities over cell masks (row-blocked)...")
         t0 = time.time()
         cell_counts, cell_sums = _labeled_sums_chunked(cellseg_mask, cell_value_planes)
         logging.info(f"  [TIMING] labeled cell aggregation: {time.time() - t0:.1f}s")
@@ -12950,9 +12287,7 @@ def calculate_ccfs_measurements(xoa_morphology_files, cellseg_mask, cell_masks_z
     streaming path never does this.
     """
     if isinstance(cellseg_mask, LazyLabelPlane):
-        logging.info(
-            "  Materialising the cell mask for regionprops (legacy focus path)..."
-        )
+        logging.info("  Materialising the cell mask for regionprops (legacy focus path)...")
         # A full-height slice; LazyLabelPlane already returns numpy. Not
         # np.asarray(...): this function has its own local `import numpy as np`
         # further down, so `np` is a local name here and referencing it before
@@ -12961,10 +12296,14 @@ def calculate_ccfs_measurements(xoa_morphology_files, cellseg_mask, cell_masks_z
     import numpy as np
     import pandas as pd
 
+    # Only this legacy --legacy-focus path needs the napari regionprops plugin,
+    # so it is imported here and declared in the optional `image-regionprops`
+    # extra. A module-level import would make the whole package unimportable
+    # wherever that extra is not installed.
+    from napari_skimage_regionprops import regionprops_table
+
     # Load full resolution image channels only when needed
-    fullres_channels = imread(
-        xoa_morphology_files[0], is_ome=False, level=0, aszarr=False
-    )
+    fullres_channels = imread(xoa_morphology_files[0], is_ome=False, level=0, aszarr=False)
 
     # Check number of channels (could be 2D array for single channel, or 3D array for multi-channel)
     if len(fullres_channels.shape) == 2:
@@ -12983,9 +12322,7 @@ def calculate_ccfs_measurements(xoa_morphology_files, cellseg_mask, cell_masks_z
     nuclear_mask = np.array(cell_masks_zarr.get("masks").get("0"))
 
     # Per-nucleus measurements on DAPI image
-    nucleus_props = pd.DataFrame(
-        regionprops_table(dapi_image, nuclear_mask, position=True)
-    )
+    nucleus_props = pd.DataFrame(regionprops_table(dapi_image, nuclear_mask, position=True))
     # Calculate CCFS_DAPI
     mean_intensity = nucleus_props["mean_intensity"]
     std_intensity = nucleus_props["standard_deviation_intensity"]
@@ -12995,9 +12332,7 @@ def calculate_ccfs_measurements(xoa_morphology_files, cellseg_mask, cell_masks_z
     del dapi_image
 
     # Get CellID for each nucleus by measuring mean intensity in cellseg_mask
-    cellid_props = pd.DataFrame(
-        regionprops_table(cellseg_mask, nuclear_mask, position=True)
-    )
+    cellid_props = pd.DataFrame(regionprops_table(cellseg_mask, nuclear_mask, position=True))
     nucleus_props["CellID"] = cellid_props["mean_intensity"].astype(int)
     del nuclear_mask, cellid_props
 
@@ -13008,9 +12343,7 @@ def calculate_ccfs_measurements(xoa_morphology_files, cellseg_mask, cell_masks_z
         del boundary_image
     else:
         # Create empty boundary_props if boundary channel not available
-        boundary_props = pd.DataFrame(
-            {"CellID": nucleus_props["CellID"], "mean_intensity": np.nan}
-        )
+        boundary_props = pd.DataFrame({"CellID": nucleus_props["CellID"], "mean_intensity": np.nan})
 
     # Measure RNA (interior) intensity per cell
     if rna_image is not None:
@@ -13081,9 +12414,7 @@ def _check_cell_data_exists(xenium_bundle_dir):
     )
 
     # Also check for analysis.tar.gz (test data)
-    has_analysis = (
-        clusters_path.exists() or (xenium_bundle_dir / "analysis.tar.gz").is_file()
-    )
+    has_analysis = clusters_path.exists() or (xenium_bundle_dir / "analysis.tar.gz").is_file()
 
     for f in required_files:
         if not f.exists():
@@ -13097,143 +12428,7 @@ def _check_cell_data_exists(xenium_bundle_dir):
     return True
 
 
-@click.command()
-@click.option(
-    "--xenium-bundle-dir", required=True, help="Path to Xenium bundle directory"
-)
-@click.option("--outdir", required=True, help="Output directory for results")
-@click.option(
-    "--stain-names",
-    default=None,
-    help="Semicolon-separated list of stain names. If not provided, uses defaults.",
-)
-@click.option(
-    "--roi-size", default=35, type=int, show_default=True, help="Tile size in pixels"
-)
-@click.option(
-    "--max-scatter-points",
-    default=10000,
-    type=int,
-    show_default=True,
-    help="Maximum number of points to plot in scatter figures. Set to 0 to plot all points.",
-)
-@click.option(
-    "--legacy-focus",
-    is_flag=True,
-    default=False,
-    help="Use legacy per-tile loop focus scoring instead of the default convolution-based GPU-accelerated method.",
-)
-@click.option(
-    "--sample-id",
-    default=None,
-    help="Sample identifier for logging and metrics output.",
-)
-@click.option(
-    "--no-snr",
-    is_flag=True,
-    default=False,
-    help="Disable SNR metrics (image Otsu / quartiles, transcripts, slide matrix, neg spatial).",
-)
-@click.option(
-    "--snr-no-roi-tx-table",
-    is_flag=True,
-    default=False,
-    help="Do not write SNR_roi_tx.parquet (or .csv.gz) alongside roi_qc_metrics.",
-)
-@click.option(
-    "--snr-otsu-max-rois",
-    type=int,
-    default=None,
-    help="Cap tiles for per-tile Otsu image SNR (default: all tiles).",
-)
-@click.option(
-    "--snr-with-moran",
-    is_flag=True,
-    default=False,
-    help="SNR only: enable Moran's I for neg spatial (needs PySAL/esda; default off).",
-)
-@click.option(
-    "--stream-tiles/--no-stream-tiles",
-    "stream_tiles",
-    default=True,
-    help=(
-        "Reduce each tile as it is computed instead of assembling full-resolution "
-        "pixel planes (default: stream). The planes cost ~154 GB of scratch on a "
-        "5.5 gigapixel sample and mmap over a FUSE/S3 work directory is "
-        "pathological; no downstream metric needs a whole plane. "
-        "--no-stream-tiles restores the plane-based path, and "
-        "--save-dapi-maps-tiff implies it."
-    ),
-)
-@click.option(
-    "--save-dapi-maps-tiff",
-    "save_dapi_maps_tiff",
-    is_flag=True,
-    default=False,
-    help=(
-        "Write full-resolution per-pixel maps as tiled float32 TIFF "
-        "(dapi_focus/mean/lap_var and boundary/intrna focus/mean when present). "
-        "Default off — QC and SNR use in-memory arrays only; enable for archival "
-        "or external tools (large files)."
-    ),
-)
-@click.option(
-    "--max-gpus",
-    "max_gpus",
-    default=0,
-    type=int,
-    help=(
-        "Cap the number of CUDA devices used (0 = use every device detected). "
-        "Nextflow's `accelerator` directive only sizes the Batch request; it does "
-        "not restrict CUDA visibility, so a task that asked for one GPU but landed "
-        "on a multi-GPU instance would otherwise use all of them."
-    ),
-)
-@click.option(
-    "--roi-thresholds-yaml",
-    default=None,
-    type=click.Path(exists=True),
-    help="Path to tile image QC thresholds YAML. Overrides hardcoded defaults.",
-)
-@click.option(
-    "--lap-sigma",
-    default=1.0,
-    type=float,
-    show_default=True,
-    help="Gaussian sigma for Laplacian of Gaussian (LoG) pre-smoothing.",
-)
-@click.option(
-    "--pipeline-segmentation",
-    default="skip",
-    show_default=True,
-    help="Pipeline segmentation method (params.segmentation); 'skip' for none.",
-)
-@click.option(
-    "--is-resegmented",
-    is_flag=True,
-    default=False,
-    help="Set when this run analyses a pipeline-resegmented bundle (post-seg).",
-)
-@click.option(
-    "--figure-source-tables/--no-figure-source-tables",
-    "figure_source_tables",
-    default=False,
-    help=(
-        "Write the per-figure figures_source/*.csv source-data exports "
-        "(unused downstream; default off; ~80s on a 5.5 GP sample)."
-    ),
-)
-@click.option(
-    "--figures/--no-figures",
-    "figures",
-    default=True,
-    help=(
-        "Generate QC figures (default true; --no-figures skips all figure "
-        "rendering for a metrics-only fast run). Metric/JSON/parquet outputs "
-        "are always computed regardless of this flag."
-    ),
-)
-def main(
+def run_image_qc(
     xenium_bundle_dir,
     outdir,
     stain_names,
@@ -13254,6 +12449,7 @@ def main(
     is_resegmented,
     figure_source_tables,
     figures,
+    device="auto",
 ):
     """
     Combined Xenium Image QC pipeline.
@@ -13360,7 +12556,7 @@ def main(
         ]
     else:
         xoa_morphology_files = sorted(
-            list(morphology_focus_dir.glob("ch000*.ome.tif")),
+            morphology_focus_dir.glob("ch000*.ome.tif"),
             key=lambda x: x.stem.split("_")[0],
         )
 
@@ -13371,9 +12567,7 @@ def main(
     if len(xoa_morphology_files) < 1:
         raise ValueError("No morphology files found in morphology_focus/ directory")
     if not xoa_morphology_files[0].exists():
-        raise ValueError(
-            f"Morphology focus file does not exist: {xoa_morphology_files[0]}"
-        )
+        raise ValueError(f"Morphology focus file does not exist: {xoa_morphology_files[0]}")
 
     # Load and prepare data (creates output directories)
     data = load_and_prepare_data(xenium_bundle_dir, outdir)
@@ -13392,9 +12586,7 @@ def main(
         _shape_str += f", Boundary={small1.shape}"
     if small2 is not None:
         _shape_str += f", IntRNA={small2.shape}"
-    logging.info(
-        f"Loaded morphology images ({_n_channels_loaded} channel(s)): {_shape_str}"
-    )
+    logging.info(f"Loaded morphology images ({_n_channels_loaded} channel(s)): {_shape_str}")
     logging.info(f"[TIMING] Loading morphology images: {time.time() - t0:.1f}s")
     _log_mem("morphology loaded")
 
@@ -13432,16 +12624,7 @@ def main(
     else:
         logging.info(f"Using tile size: {roi_size}px")
 
-    # Auto-detect available GPUs
-    available_gpus = detect_gpu_ids()
-    if available_gpus and max_gpus and len(available_gpus) > max_gpus:
-        logging.info(
-            f"Detected {len(available_gpus)} GPU(s) {available_gpus} but --max-gpus "
-            f"={max_gpus}; using {available_gpus[:max_gpus]}. The accelerator "
-            "directive sizes the Batch request only, it does not limit CUDA "
-            "visibility."
-        )
-        available_gpus = available_gpus[:max_gpus]
+    available_gpus = resolve_available_gpus(device, max_gpus)
     if available_gpus:
         logging.info(f"Detected {len(available_gpus)} GPU(s): {available_gpus}")
     else:
@@ -13472,9 +12655,7 @@ def main(
                 "  --save-dapi-maps-tiff requires full pixel planes; "
                 "streaming disabled for this run"
             )
-        logging.info(
-            f"  Tile reduction mode: {'streamed' if _stream else 'pixel planes'}"
-        )
+        logging.info(f"  Tile reduction mode: {'streamed' if _stream else 'pixel planes'}")
         df_grid_roi, focus_maps, streamed = calculate_roi_focusscore(
             xoa_morphology_files,
             roi_size=roi_size,
@@ -13489,9 +12670,7 @@ def main(
             # a bundle without cells.zarr.zip has no masks to reduce over, and
             # opening it during the tile pass would fail where the plane path
             # simply skipped the whole cell section.
-            cell_masks_path=(
-                data["cell_masks_path"] if _stream and has_cell_data else None
-            ),
+            cell_masks_path=(data["cell_masks_path"] if _stream and has_cell_data else None),
             # Reuse the already-loaded level-3 DAPI plane and the tissue mask
             # generate_tissue_mask just computed from it, instead of re-decoding
             # level 3 and recomputing the mask inside calculate_roi_focusscore.
@@ -13574,9 +12753,7 @@ def main(
             )
             n_blurred_2d = int(df_grid_roi["is_blurred_gmm_2d"].sum())
             n_in_focus_2d = int((~df_grid_roi["is_blurred_gmm_2d"]).sum())
-            logging.info(
-                f"  Blurred: {n_blurred_2d:,}, In-focus: {n_in_focus_2d:,} (2D GMM)"
-            )
+            logging.info(f"  Blurred: {n_blurred_2d:,}, In-focus: {n_in_focus_2d:,} (2D GMM)")
         except Exception as e:
             logging.warning(f"  Warning: 2D GMM failed: {e}")
             logging.info("  Continuing with 1D GMM results only")
@@ -13616,9 +12793,7 @@ def main(
     # Save threshold configuration
     total_rois_gmm = int(len(df_grid_roi))
     n_blurred_gmm = int(df_grid_roi["is_blurred_gmm"].sum())
-    pct_blurred_gmm = (
-        (n_blurred_gmm / total_rois_gmm * 100.0) if total_rois_gmm > 0 else 0.0
-    )
+    pct_blurred_gmm = (n_blurred_gmm / total_rois_gmm * 100.0) if total_rois_gmm > 0 else 0.0
 
     threshold_config = {
         "roi_focus_score_threshold": float(roi_threshold),
@@ -13669,9 +12844,7 @@ def main(
             "fraction_rois_blurred_gmm": float(pct_blurred_gmm_2d),
             "features": ["log1p(dapi_focus_score)", "log1p(dapi_lap_var)"],
         }
-        threshold_config["units"]["component_means_2d"] = (
-            "[log1p(focus_score), log1p(lap_var)]"
-        )
+        threshold_config["units"]["component_means_2d"] = "[log1p(focus_score), log1p(lap_var)]"
 
     threshold_json = data["outdir"] / "roi_blur_threshold.json"
     with open(threshold_json, "w") as f:
@@ -13851,9 +13024,7 @@ def main(
         if (xenium_bundle_dir_path / "analysis.tar.gz").is_file():
             import shutil
 
-            shutil.unpack_archive(
-                xenium_bundle_dir_path / "analysis.tar.gz", extract_dir="."
-            )
+            shutil.unpack_archive(xenium_bundle_dir_path / "analysis.tar.gz", extract_dir=".")
             cell_data["clusters_csv_path"] = (
                 Path("analysis")
                 / "clustering"
@@ -13861,10 +13032,7 @@ def main(
                 / "clusters.csv"
             )
             cell_data["umap_path"] = (
-                Path("analysis")
-                / "umap"
-                / "gene_expression_2_components"
-                / "projection.csv"
+                Path("analysis") / "umap" / "gene_expression_2_components" / "projection.csv"
             )
         else:
             cell_data["clusters_csv_path"] = (
@@ -13959,9 +13127,7 @@ def main(
         logging.info(f"[TIMING] map_grid_roi_to_cells(): {time.time() - t0:.1f}s")
 
         # Load ROI blur threshold
-        roi_threshold_cell, roi_intensity_threshold = load_roi_blur_threshold(
-            data["outdir"]
-        )
+        roi_threshold_cell, roi_intensity_threshold = load_roi_blur_threshold(data["outdir"])
         if roi_threshold_cell is None or roi_intensity_threshold is None:
             roi_threshold_cell = roi_threshold
             roi_intensity_threshold = _roi_intensity_threshold
@@ -13987,9 +13153,7 @@ def main(
         if "In-Area-with-Artefact" not in df_spatial.columns:
             # Map dense_intensity_regions to the artefact column name
             if "Dense-Intensity-Region-ID" in df_spatial.columns:
-                df_spatial["In-Area-with-Artefact"] = df_spatial[
-                    "Dense-Intensity-Region-ID"
-                ]
+                df_spatial["In-Area-with-Artefact"] = df_spatial["Dense-Intensity-Region-ID"]
             else:
                 df_spatial["In-Area-with-Artefact"] = 0
 
@@ -14036,9 +13200,7 @@ def main(
             figures_cell_centred_dir = data["outdir"] / "figures_cell_centred"
             figures_cell_centred_dir.mkdir(parents=True, exist_ok=True)
             figures_cell_centred_source = (
-                (figures_cell_centred_dir / "figures_source")
-                if figure_source_tables
-                else None
+                (figures_cell_centred_dir / "figures_source") if figure_source_tables else None
             )
             if figures_cell_centred_source is not None:
                 figures_cell_centred_source.mkdir(parents=True, exist_ok=True)
@@ -14074,9 +13236,7 @@ def main(
             "mean_ccfs_dapi": float(new_df["CCFS_DAPI"].mean()),
             "median_ccfs_dapi": float(new_df["CCFS_DAPI"].median()),
             "ccfs_low_texture_threshold": float(_ccfs_low_texture_threshold),
-            "cells_high_nuclear_texture": len(
-                new_df[new_df["is_high_nuclear_texture"]]
-            ),
+            "cells_high_nuclear_texture": len(new_df[new_df["is_high_nuclear_texture"]]),
             "cells_low_nuclear_texture": n_ccfs_low_texture,
             "pct_low_nuclear_texture": round(100.0 * n_ccfs_low_texture / n_total, 4)
             if n_total > 0
@@ -14085,9 +13245,7 @@ def main(
             "cells_near_holes": len(new_df[new_df["is_near_hole"]]),
             "cells_with_artifacts": int(new_df["has_artifacts"].sum()),
             "clusters_present": sorted(new_df["Cluster_kmeans10"].unique().tolist()),
-            "segmentation_methods": sorted(
-                new_df["segmentation_method"].unique().tolist()
-            ),
+            "segmentation_methods": sorted(new_df["segmentation_method"].unique().tolist()),
         }
         # Phase 2a-revised: per-cell aggregate emissions for Section 9.A's
         # sample-level aggregates table + 9.B's roi_tissue_coverage row.
@@ -14128,9 +13286,7 @@ def main(
                 ),
                 (
                     "mean_intensity_Boundary",
-                    _pick_critical(
-                        "boundary", _INTENSITY_CRITICAL_DEFAULTS["boundary"]
-                    ),
+                    _pick_critical("boundary", _INTENSITY_CRITICAL_DEFAULTS["boundary"]),
                     "pct_cells_below_intensity_Boundary",
                 ),
                 (
@@ -14163,9 +13319,7 @@ def main(
         if "roi_tissue_coverage" in new_df.columns and n_total > 0:
             _n_low_cov = int((new_df["roi_tissue_coverage"] < 0.5).sum())
             qc_metrics["cells_in_low_coverage_tiles"] = _n_low_cov
-            qc_metrics["pct_cells_in_low_coverage_tiles"] = round(
-                100.0 * _n_low_cov / n_total, 4
-            )
+            qc_metrics["pct_cells_in_low_coverage_tiles"] = round(100.0 * _n_low_cov / n_total, 4)
 
         # GMM-ROI blur metrics (if cell-to-ROI mapping was performed).
         # 2026-06-24: pct_blurred_gmm_2d_roi is reported over SOLID-tissue cells
@@ -14183,10 +13337,7 @@ def main(
                 round(100.0 * _n_blur_all / n_total, 4) if n_total > 0 else 0.0
             )
             if "roi_tissue_coverage" in new_df.columns:
-                _solid = (
-                    new_df["roi_tissue_coverage"]
-                    >= ROI_MIN_TISSUE_COVERAGE_FOR_INTENSITY_QC
-                )
+                _solid = new_df["roi_tissue_coverage"] >= ROI_MIN_TISSUE_COVERAGE_FOR_INTENSITY_QC
             else:
                 _solid = _blur.notna()
             _n_solid = int(_solid.sum())
@@ -14200,15 +13351,12 @@ def main(
                 # Derived from the constant actually applied above. It was
                 # hardcoded "..._ge_0.5" while the filter used 0.2, so the
                 # published label named a cutoff the code did not use.
-                "solid_tissue_cells_coverage_ge_"
-                f"{ROI_MIN_TISSUE_COVERAGE_FOR_INTENSITY_QC:g}"
+                f"solid_tissue_cells_coverage_ge_{ROI_MIN_TISSUE_COVERAGE_FOR_INTENSITY_QC:g}"
                 if "roi_tissue_coverage" in new_df.columns
                 else "all_cells"
             )
             agreement = int(
-                (
-                    new_df["is_low_nuclear_texture"] == new_df["is_blurred_gmm_2d_roi"]
-                ).sum()
+                (new_df["is_low_nuclear_texture"] == new_df["is_blurred_gmm_2d_roi"]).sum()
             )
             qc_metrics["ccfs_gmm_agreement_pct"] = (
                 round(100.0 * agreement / n_total, 4) if n_total > 0 else 0.0
@@ -14249,10 +13397,7 @@ def main(
         # Consumed by the §4.3 Tier-3 row and the §4.6 per-cluster breakdown in
         # notebooks/xenium_image_qc_report.qmd. Hidden by the qmd until this
         # field is present in the JSON.
-        if (
-            "Cluster_kmeans10" in new_df.columns
-            and "is_low_nuclear_texture" in new_df.columns
-        ):
+        if "Cluster_kmeans10" in new_df.columns and "is_low_nuclear_texture" in new_df.columns:
             cluster_ccfs = {}
             for cl, grp in new_df.groupby("Cluster_kmeans10"):
                 n_cl = len(grp)
@@ -14270,9 +13415,7 @@ def main(
             # Same robust rule as cluster_blur. The absolute floor backstops the
             # MAD=0 case — most clusters sit near 0% low-texture, so a real spike
             # is caught by the floor even when the spread is degenerate.
-            ccfs_outlier_clusters = detect_cluster_outliers(
-                cluster_ccfs, "pct_low_texture"
-            )
+            ccfs_outlier_clusters = detect_cluster_outliers(cluster_ccfs, "pct_low_texture")
             if ccfs_outlier_clusters:
                 qc_metrics["cluster_ccfs_outliers"] = ccfs_outlier_clusters
 
@@ -14325,6 +13468,161 @@ def main(
     logging.info(f"  Tile metrics: {data['outdir'] / 'roi_qc_metrics.json'}")
     logging.info(f"  Versions: {data['outdir'] / 'versions.yml'}")
     logging.info("=" * 60)
+
+
+@click.command()
+@click.option("--xenium-bundle-dir", required=True, help="Path to Xenium bundle directory")
+@click.option("--outdir", required=True, help="Output directory for results")
+@click.option(
+    "--stain-names",
+    default=None,
+    help="Semicolon-separated list of stain names. If not provided, uses defaults.",
+)
+@click.option("--roi-size", default=35, type=int, show_default=True, help="Tile size in pixels")
+@click.option(
+    "--max-scatter-points",
+    default=10000,
+    type=int,
+    show_default=True,
+    help="Maximum number of points to plot in scatter figures. Set to 0 to plot all points.",
+)
+@click.option(
+    "--legacy-focus",
+    is_flag=True,
+    default=False,
+    help="Use legacy per-tile loop focus scoring instead of the default convolution-based GPU-accelerated method.",
+)
+@click.option(
+    "--sample-id",
+    default=None,
+    help="Sample identifier for logging and metrics output.",
+)
+@click.option(
+    "--no-snr",
+    is_flag=True,
+    default=False,
+    help="Disable SNR metrics (image Otsu / quartiles, transcripts, slide matrix, neg spatial).",
+)
+@click.option(
+    "--snr-no-roi-tx-table",
+    is_flag=True,
+    default=False,
+    help="Do not write SNR_roi_tx.parquet (or .csv.gz) alongside roi_qc_metrics.",
+)
+@click.option(
+    "--snr-otsu-max-rois",
+    type=int,
+    default=None,
+    help="Cap tiles for per-tile Otsu image SNR (default: all tiles).",
+)
+@click.option(
+    "--snr-with-moran",
+    is_flag=True,
+    default=False,
+    help="SNR only: enable Moran's I for neg spatial (needs PySAL/esda; default off).",
+)
+@click.option(
+    "--stream-tiles/--no-stream-tiles",
+    "stream_tiles",
+    default=True,
+    help=(
+        "Reduce each tile as it is computed instead of assembling full-resolution "
+        "pixel planes (default: stream). The planes cost ~154 GB of scratch on a "
+        "5.5 gigapixel sample and mmap over a FUSE/S3 work directory is "
+        "pathological; no downstream metric needs a whole plane. "
+        "--no-stream-tiles restores the plane-based path, and "
+        "--save-dapi-maps-tiff implies it."
+    ),
+)
+@click.option(
+    "--save-dapi-maps-tiff",
+    "save_dapi_maps_tiff",
+    is_flag=True,
+    default=False,
+    help=(
+        "Write full-resolution per-pixel maps as tiled float32 TIFF "
+        "(dapi_focus/mean/lap_var and boundary/intrna focus/mean when present). "
+        "Default off — QC and SNR use in-memory arrays only; enable for archival "
+        "or external tools (large files)."
+    ),
+)
+@click.option(
+    "--max-gpus",
+    "max_gpus",
+    default=0,
+    type=int,
+    help=(
+        "Cap the number of CUDA devices used (0 = use every device detected). "
+        "Nextflow's `accelerator` directive only sizes the Batch request; it does "
+        "not restrict CUDA visibility, so a task that asked for one GPU but landed "
+        "on a multi-GPU instance would otherwise use all of them."
+    ),
+)
+@click.option(
+    "--roi-thresholds-yaml",
+    default=None,
+    type=click.Path(exists=True),
+    help="Path to tile image QC thresholds YAML. Overrides hardcoded defaults.",
+)
+@click.option(
+    "--lap-sigma",
+    default=1.0,
+    type=float,
+    show_default=True,
+    help="Gaussian sigma for Laplacian of Gaussian (LoG) pre-smoothing.",
+)
+@click.option(
+    "--pipeline-segmentation",
+    default="skip",
+    show_default=True,
+    help="Pipeline segmentation method (params.segmentation); 'skip' for none.",
+)
+@click.option(
+    "--is-resegmented",
+    is_flag=True,
+    default=False,
+    help="Set when this run analyses a pipeline-resegmented bundle (post-seg).",
+)
+@click.option(
+    "--figure-source-tables/--no-figure-source-tables",
+    "figure_source_tables",
+    default=False,
+    help=(
+        "Write the per-figure figures_source/*.csv source-data exports "
+        "(unused downstream; default off; ~80s on a 5.5 GP sample)."
+    ),
+)
+@click.option(
+    "--figures/--no-figures",
+    "figures",
+    default=True,
+    help=(
+        "Generate QC figures (default true; --no-figures skips all figure "
+        "rendering for a metrics-only fast run). Metric/JSON/parquet outputs "
+        "are always computed regardless of this flag."
+    ),
+)
+@click.option(
+    "--device",
+    type=click.Choice(["auto", "cpu", "gpu"]),
+    default="auto",
+    show_default=True,
+    help=(
+        "Compute backend. 'cpu' forces the CPU path even where a GPU is "
+        "visible; 'gpu' requires a usable CUDA device and fails if none is "
+        "found rather than silently falling back; 'auto' uses the GPU when one "
+        "is present. Automated callers should pass cpu or gpu explicitly, so a "
+        "misconfigured GPU node fails loudly instead of running ~50x slower."
+    ),
+)
+def main(**kwargs):
+    """Command-line entry point for image QC.
+
+    Deliberately thin: argument parsing lives in the decorators above,
+    everything else lives in :func:`run_image_qc`, which is importable without
+    click and is what the tests and library callers use.
+    """
+    return run_image_qc(**kwargs)
 
 
 if __name__ == "__main__":

@@ -21,25 +21,14 @@ so a later decision to exclude it is a visible change rather than a silent one.
 
 from __future__ import annotations
 
-import importlib
-import importlib.util
-from pathlib import Path
-
 import numpy as np
 import pandas as pd
 
-# snr_metrics is stubbed by other test modules (they share sys.modules), so a plain
-# import can hand back an empty ModuleType depending on collection order. Load the
-# real module by path, the same way test_tile_consumers.py does, so this file works
-# whatever ran first.
-_snr_path = (
-    Path(__file__).resolve().parent.parent / "snr_metrics.py"
-)
-_spec = importlib.util.spec_from_file_location("_real_snr_metrics", _snr_path)
-assert _spec is not None and _spec.loader is not None  # narrow for mypy; path is checked above
-snr_metrics = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(snr_metrics)
-
+# The module comes from the installed package under its real dotted name, so the
+# bare `snr_metrics` ModuleType that other test modules park in sys.modules can no
+# longer shadow it. The previous spec_from_file_location dance existed only to
+# dodge that shadowing and is gone.
+from spatialqc.image import snr as snr_metrics
 
 # ---------------------------------------------------------------------------
 # classification
@@ -48,9 +37,7 @@ _spec.loader.exec_module(snr_metrics)
 
 def test_unassigned_codeword_is_excluded():
     assert snr_metrics.is_excluded_feature("UnassignedCodeword_0123")
-    assert snr_metrics.is_excluded_feature("unassignedcodeword_0123"), (
-        "case-insensitive"
-    )
+    assert snr_metrics.is_excluded_feature("unassignedcodeword_0123"), "case-insensitive"
 
 
 def test_unassigned_codeword_is_not_a_negative_control():
@@ -123,9 +110,7 @@ def test_the_three_categories_are_disjoint_and_cover_everything():
 
 def _one_tile_frame():
     """A single tile covering everything, so every transcript lands in it."""
-    return pd.DataFrame(
-        {"roi_id": [0], "x1": [0.0], "x2": [100.0], "y1": [0.0], "y2": [100.0]}
-    )
+    return pd.DataFrame({"roi_id": [0], "x1": [0.0], "x2": [100.0], "y1": [0.0], "y2": [100.0]})
 
 
 def _count(names: list[str]):
@@ -154,9 +139,7 @@ def _count(names: list[str]):
 
 def test_unassigned_codewords_leave_all_three_counts():
     """5 genes, 2 neg controls, 3 unassigned: the 3 vanish from every count."""
-    names = (
-        ["EPCAM"] * 5 + ["NegControlProbe_00042"] * 2 + ["UnassignedCodeword_0001"] * 3
-    )
+    names = ["EPCAM"] * 5 + ["NegControlProbe_00042"] * 2 + ["UnassignedCodeword_0001"] * 3
     real, neg, total = _count(names)
 
     assert real == 5, "unassigned codewords are still being counted as real signal"
@@ -169,9 +152,7 @@ def test_ratio_is_not_inflated_by_decoding_failures():
     """The point of the fix: adding unassigned codewords must not change the ratio."""
     clean = _count(["EPCAM"] * 20 + ["NegControlProbe_00042"] * 4)
     dirty = _count(
-        ["EPCAM"] * 20
-        + ["NegControlProbe_00042"] * 4
-        + ["UnassignedCodeword_0001"] * 50
+        ["EPCAM"] * 20 + ["NegControlProbe_00042"] * 4 + ["UnassignedCodeword_0001"] * 50
     )
     assert clean == dirty, (
         "50 failed barcode reads changed the counts, so they are still reaching "

@@ -27,8 +27,6 @@ def write_tile(task: tuple[dict[str, int], float]) -> float:
     """Write *value* into this tile's disjoint write region and flush."""
     spec, value = task
     plane = _STATE["plane"]
-    plane[spec["write_y0"] : spec["write_y1"], spec["write_x0"] : spec["write_x1"]] = (
-        value
-    )
+    plane[spec["write_y0"] : spec["write_y1"], spec["write_x0"] : spec["write_x1"]] = value
     plane.flush()
     return value

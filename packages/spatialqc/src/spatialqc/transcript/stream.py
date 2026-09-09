@@ -80,16 +80,10 @@ def _aggregate(dataset, scan_columns, project_exprs, project_names, aggregates, 
         [
             acero.Declaration(
                 "scan",
-                acero.ScanNodeOptions(
-                    dataset, columns=list(scan_columns), **_SCAN_READAHEAD
-                ),
+                acero.ScanNodeOptions(dataset, columns=list(scan_columns), **_SCAN_READAHEAD),
             ),
-            acero.Declaration(
-                "project", acero.ProjectNodeOptions(project_exprs, project_names)
-            ),
-            acero.Declaration(
-                "aggregate", acero.AggregateNodeOptions(aggregates, keys=keys)
-            ),
+            acero.Declaration("project", acero.ProjectNodeOptions(project_exprs, project_names)),
+            acero.Declaration("aggregate", acero.AggregateNodeOptions(aggregates, keys=keys)),
         ]
     ).to_table(use_threads=True)
 
@@ -185,11 +179,7 @@ def aggregate_transcripts(path, background_cell_id: str) -> TranscriptStats:
         [("codeword_category", "hash_count", None, "n")],
         ["codeword_category"],
     )
-    codeword = (
-        cw_tbl.to_pandas()
-        .set_index("codeword_category")["n"]
-        .sort_values(ascending=False)
-    )
+    codeword = cw_tbl.to_pandas().set_index("codeword_category")["n"].sort_values(ascending=False)
 
     # Per-cell nucleus fraction, assigned cells only. Filter before aggregating so
     # the sentinel never becomes a group.
@@ -243,9 +233,7 @@ def aggregate_transcripts(path, background_cell_id: str) -> TranscriptStats:
             ),
             acero.Declaration(
                 "project",
-                acero.ProjectNodeOptions(
-                    [pc.field("is_gene").cast(pa.int64())], ["is_gene"]
-                ),
+                acero.ProjectNodeOptions([pc.field("is_gene").cast(pa.int64())], ["is_gene"]),
             ),
             acero.Declaration(
                 "aggregate",

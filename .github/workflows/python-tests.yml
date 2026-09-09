@@ -5,11 +5,15 @@ name: Python tests
 # tests run with `-stub`, so without this workflow none of the QC Python code is
 # ever executed in CI.
 #
-# The scripts import their heavy dependencies at module scope, so the tests need
+# The QC analysis imports heavy dependencies at module scope, so the tests need
 # a real runtime environment (matplotlib, tifffile, scanpy, ...), not a linting
 # environment. The env is therefore built from the QC modules' own
 # environment.yml files plus the test-only extras, which keeps every runtime pin
 # declared in exactly one place.
+#
+# The QC code now lives in the `spatialqc` package under packages/spatialqc. It
+# is installed editable so the suite exercises this checkout rather than any
+# published wheel, and so imports resolve without sys.path manipulation.
 on:
   push:
     branches:
@@ -42,15 +46,27 @@ jobs:
           # environments: those cannot be co-installed (image QC pins
           # pyarrow 21, while transcript QC's anndata requires pyarrow <21), so
           # the test environment declares its own coherent set.
-          environment-file: bin/tests/environment.yml
+          environment-file: packages/spatialqc/tests/environment.yml
           cache-environment: true
+
+      - name: Install spatialqc from this checkout
+        shell: bash -el {0}
+        # --no-deps because every runtime dependency is already pinned and
+        # installed by the conda environment above; letting pip resolve the
+        # extras here would shadow those pins with PyPI builds.
+        run: pip install -e packages/spatialqc --no-deps
 
       - name: Show environment
         shell: bash -el {0}
         run: |
           python --version
           python -c "import numpy, pandas, matplotlib, tifffile, scanpy; print('runtime imports OK')"
+          python -c "import spatialqc; print('spatialqc', spatialqc.__version__)"
+          spatialqc-image-qc --help > /dev/null && echo "image QC console script OK"
+          spatialqc-transcript-qc --help > /dev/null && echo "transcript QC console script OK"
 
       - name: Run pytest
         shell: bash -el {0}
-        run: pytest tests/ bin/tests/ -v -n auto
+        # tests/ holds the xenium_patch suite; packages/spatialqc/tests holds the
+        # QC suite. GPU-marked tests skip themselves on this CPU-only runner.
+        run: pytest tests/ packages/spatialqc/tests/ -v -n auto

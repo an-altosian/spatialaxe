@@ -6,7 +6,10 @@ process TRANSCRIPT_QC_PROCESSING {
     // Built from environment.yml in this directory (see the module Dockerfile).
     // Hosted on the author's quay.io namespace for now; to be migrated to the
     // nf-core org before release.
-    container "quay.io/dongzehe/transcript_qc:1.1.0"
+    // 2.0.0 is the first tag that carries the `spatialqc` package and therefore
+    // the `spatialqc-transcript-qc` console script. NOT YET BUILT: docker-profile
+    // tests fail until this image is published.
+    container "quay.io/dongzehe/transcript_qc:2.0.0"
 
     input:
     tuple val(meta), val(parameters), path(input_files)
@@ -14,6 +17,7 @@ process TRANSCRIPT_QC_PROCESSING {
     output:
     tuple val(meta), path(outdir), emit: outdir
     tuple val("${task.process}"), val('python'), eval("python3 --version | sed 's/Python //'"), topic: versions, emit: versions_python
+    tuple val("${task.process}"), val('spatialqc'), eval("python3 -c 'import spatialqc; print(spatialqc.__version__)'"), topic: versions, emit: versions_spatialqc
     tuple val("${task.process}"), val('numpy'), eval("python3 -c 'import numpy; print(numpy.__version__)'"), topic: versions, emit: versions_numpy
     tuple val("${task.process}"), val('pandas'), eval("python3 -c 'import pandas; print(pandas.__version__)'"), topic: versions, emit: versions_pandas
     tuple val("${task.process}"), val('pyarrow'), eval("python3 -c 'import pyarrow; print(pyarrow.__version__)'"), topic: versions, emit: versions_pyarrow
@@ -96,7 +100,7 @@ process TRANSCRIPT_QC_PROCESSING {
     export NUMBA_NUM_THREADS="$task.cpus"
 
 
-    transcript_qc_processing.py \\
+    spatialqc-transcript-qc \\
         ${args.join(' \\\n        ')}
     """
 

@@ -17,7 +17,6 @@ ladder.  These tests pin the replacements:
 
 from __future__ import annotations
 
-import importlib
 import multiprocessing
 import os
 import sys
@@ -30,15 +29,12 @@ import pytest
 from scipy.ndimage import mean as ndimage_mean
 from skimage.measure import regionprops
 
-# Same stub-then-import dance as upstream: image_qc.py has heavy top-level
-# imports that the functions under test do not need.
-# ADAPTED FROM UPSTREAM: upstream also inserted
-# `modules/local/image_qc/resources/usr/bin`, which does not exist in this
-# pipeline -- `image_qc.py` lives in the pipeline-level `bin/`. This file lives
-# in `bin/tests/`, so parent.parent is that `bin/`.
-_bin_dir = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(_bin_dir))
-# spawn passes sys.path to children, so this makes the worker helper importable there
+# Same stub-then-import dance as upstream: image_qc has heavy optional imports
+# that the functions under test do not need. The module itself now comes from the
+# installed `spatialqc` distribution, so no script directory is put on sys.path.
+# spawn passes sys.path to children, so this makes the worker helper importable
+# there (pytest also prepends this directory, but the child must not depend on
+# how pytest was invoked).
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 for _mod in (
@@ -52,8 +48,8 @@ for _mod in (
 sys.modules["napari_skimage_regionprops"].regionprops_table = lambda *a, **kw: None  # type: ignore[attr-defined]
 sys.modules["scanpy"].AnnData = object  # type: ignore[attr-defined]
 
-image_qc = importlib.import_module("image_qc")
 import helpers_memmap_worker  # noqa: E402  (needs the sys.path insert above)
+from spatialqc.image import qc as image_qc  # noqa: E402  (needs the stubs above)
 
 # /proc is Linux-only. Tests that read it directly -- via _process_rss,
 # _tree_rss, or os.listdir("/proc") -- get None or FileNotFoundError off-Linux,
@@ -145,8 +141,8 @@ def _reference_ccfs(focus_maps, nuclear_mask, cellseg_mask):
     ccfs_dapi = np.asarray(cell_focus) / dapi_norm
 
     props = regionprops(nuclear_mask)
-    label_to_ccfs = dict(zip(labels, ccfs_dapi))
-    label_to_intensity = dict(zip(labels, cell_intensity))
+    label_to_ccfs = dict(zip(labels, ccfs_dapi, strict=True))
+    label_to_intensity = dict(zip(labels, cell_intensity, strict=True))
 
     rows = []
     for p in props:
@@ -182,7 +178,7 @@ def _reference_ccfs(focus_maps, nuclear_mask, cellseg_mask):
         uniq = out["CellID"].unique()
         uniq = uniq[uniq > 0]
         per_cell = ndimage_mean(plane, cellseg_mask, uniq)
-        out[column] = out["CellID"].map(dict(zip(uniq, per_cell)))
+        out[column] = out["CellID"].map(dict(zip(uniq, per_cell, strict=True)))
 
     return out
 
@@ -197,9 +193,7 @@ class TestLabeledSumsChunked:
 
     def test_mean_matches_scipy_ndimage(self, labelled_scene):
         nuclear, _, focus, mean, _, _ = labelled_scene
-        counts, sums = image_qc._labeled_sums_chunked(
-            nuclear, {"focus": focus, "intensity": mean}
-        )
+        counts, sums = image_qc._labeled_sums_chunked(nuclear, {"focus": focus, "intensity": mean})
 
         labels = np.nonzero(counts)[0]
         labels = labels[labels > 0]
@@ -249,9 +243,7 @@ class TestLabeledSumsChunked:
         )
         np.testing.assert_array_equal(single[0], blocked[0])
         for key in single[1]:
-            np.testing.assert_allclose(
-                single[1][key], blocked[1][key], rtol=1e-12, atol=0
-            )
+            np.testing.assert_allclose(single[1][key], blocked[1][key], rtol=1e-12, atol=0)
 
     def test_accepts_row_sliceable_handle(self, labelled_scene):
         """Must never materialise the whole plane — proves zarr/memmap support."""
@@ -260,13 +252,9 @@ class TestLabeledSumsChunked:
         counts, sums = image_qc._labeled_sums_chunked(
             handle, {"focus": _RowSliceOnly(focus)}, rows_per_chunk=5
         )
-        expected_counts, expected_sums = image_qc._labeled_sums_chunked(
-            nuclear, {"focus": focus}
-        )
+        expected_counts, expected_sums = image_qc._labeled_sums_chunked(nuclear, {"focus": focus})
         np.testing.assert_array_equal(counts, expected_counts)
-        np.testing.assert_allclose(
-            sums["focus"], expected_sums["focus"], rtol=1e-12, atol=0
-        )
+        np.testing.assert_allclose(sums["focus"], expected_sums["focus"], rtol=1e-12, atol=0)
 
     def test_empty_value_planes_gives_counts_only(self, labelled_scene):
         nuclear = labelled_scene[0]
@@ -300,9 +288,7 @@ class TestCalculateCcfsFromFocusMaps:
     def test_same_rows_and_labels(self, labelled_scene):
         got, expected = self._run(labelled_scene)
         assert len(got) == len(expected)
-        np.testing.assert_array_equal(
-            got["label"].to_numpy(), expected["label"].to_numpy()
-        )
+        np.testing.assert_array_equal(got["label"].to_numpy(), expected["label"].to_numpy())
 
     @pytest.mark.parametrize(
         "column",
@@ -366,9 +352,7 @@ class TestCalculateCcfsFromFocusMaps:
             cell,
             [],
         )
-        expected = _reference_ccfs(
-            {"dapi_focus_map": focus, "dapi_mean_map": mean}, nuclear, cell
-        )
+        expected = _reference_ccfs({"dapi_focus_map": focus, "dapi_mean_map": mean}, nuclear, cell)
         np.testing.assert_allclose(
             got["CCFS_DAPI"].to_numpy(dtype=np.float64),
             expected["CCFS_DAPI"].to_numpy(dtype=np.float64),
@@ -423,9 +407,7 @@ class TestPlaneStore:
         planes by filename, so no pixel data is ever pickled.
         """
         monkeypatch.setattr(image_qc, "_PLANE_SPILL_BYTES", 1024)
-        store = image_qc._PlaneStore(
-            (32, 48), ["focus_map"], plane_dir=tmp_path, prefix="dapi"
-        )
+        store = image_qc._PlaneStore((32, 48), ["focus_map"], plane_dir=tmp_path, prefix="dapi")
         plane = store.arrays()["focus_map"]
         plane[4:9, 6:11] = 3.5
         store.flush()
@@ -443,15 +425,11 @@ class TestPlaneStore:
 
         monkeypatch.setattr(image_qc.shutil, "disk_usage", lambda _p: _TinyUsage())
         with pytest.raises(RuntimeError, match="free"):
-            image_qc._PlaneStore(
-                (128, 128), ["focus_map"], plane_dir=tmp_path, prefix="dapi"
-            )
+            image_qc._PlaneStore((128, 128), ["focus_map"], plane_dir=tmp_path, prefix="dapi")
 
     def test_release_deletes_backing_files(self, tmp_path, monkeypatch):
         monkeypatch.setattr(image_qc, "_PLANE_SPILL_BYTES", 1024)
-        store = image_qc._PlaneStore(
-            (64, 64), ["focus_map"], plane_dir=tmp_path, prefix="dapi"
-        )
+        store = image_qc._PlaneStore((64, 64), ["focus_map"], plane_dir=tmp_path, prefix="dapi")
         paths = [Path(p) for p in store.descriptors().values()]
         assert all(p.exists() for p in paths)
         store.release()
@@ -472,9 +450,7 @@ class TestCrossProcessPlaneSharing:
     trivial write instead of a CuPy kernel, so it runs without a GPU.
     """
 
-    def test_spawned_workers_writes_are_visible_to_the_parent(
-        self, tmp_path, monkeypatch
-    ):
+    def test_spawned_workers_writes_are_visible_to_the_parent(self, tmp_path, monkeypatch):
         monkeypatch.setattr(image_qc, "_PLANE_SPILL_BYTES", 1024)
         height, width = 200, 160
 
@@ -579,9 +555,7 @@ class TestMemoryInstrumentation:
         assert page_cache == 160
 
     def test_supports_cgroup_v1(self, tmp_path, monkeypatch):
-        source = self._write_cgroup(
-            tmp_path, usage=500, inactive=400, active=25, v2=False
-        )
+        source = self._write_cgroup(tmp_path, usage=500, inactive=400, active=25, v2=False)
         monkeypatch.setattr(image_qc, "_CGROUP_SOURCES", (source,))
         working_set, page_cache = image_qc._cgroup_memory()
         assert working_set == 100
@@ -725,9 +699,7 @@ class TestTreeRss:
         )
 
     def test_returns_none_when_proc_is_unreadable(self, monkeypatch):
-        monkeypatch.setattr(
-            image_qc.os, "listdir", lambda *_: (_ for _ in ()).throw(OSError())
-        )
+        monkeypatch.setattr(image_qc.os, "listdir", lambda *_: (_ for _ in ()).throw(OSError()))
         assert image_qc._tree_rss() is None
 
 
