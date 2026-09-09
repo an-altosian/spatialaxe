@@ -60,14 +60,26 @@ Sequence:
 ## 3. Extracting to a standalone repository
 
 The package was developed in-tree so the existing test suite could gate every step.
-Extract it with `git subtree split`, which preserves the history of just that subdirectory:
+Extract it with `git subtree split`, which rewrites the commits touching that subdirectory so its contents sit at the repository root:
 
 ```bash
 git subtree split --prefix=packages/spatialqc -b spatialqc-standalone
 git push git@github.com:altos-labs/spatialqc.git spatialqc-standalone:main
 ```
 
-The package directory is already self-contained: `pyproject.toml`, `README.md`, `LICENSE`, `.gitignore`, `src/`, `tests/`, and `.github/workflows/ci.yml`, which becomes active once it sits at a repository root.
+This has been run on `feat/spatialqc-package` and verified: the resulting branch has `pyproject.toml`, `README.md`, `LICENSE`, `.gitignore`, `src/`, `tests/` and `.github/workflows/ci.yml` at its root, with both threshold YAMLs and `py.typed` present, and the CI workflow becomes active once it is a repository root.
+
+One caveat to set expectations: `subtree split` filters by path, so the extracted branch carries only the commits that touched `packages/spatialqc` — four, at the time of writing.
+The scripts' earlier history under `bin/` does **not** follow, because that is a different path.
+If the full provenance of `image_qc.py` matters in the new repository, use `git filter-repo` with a path rename instead:
+
+```bash
+git filter-repo --path bin/image_qc.py --path bin/snr_metrics.py \
+    --path bin/transcript_qc_processing.py --path bin/transcript_stream.py \
+    --path packages/spatialqc --path-rename packages/spatialqc/:
+```
+
+Otherwise keep this repository as the historical record and let the new one start from the extraction point.
 
 After extraction, in this repository:
 
