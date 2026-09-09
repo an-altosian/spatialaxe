@@ -191,20 +191,54 @@ def test_laplace_parity_cpu_vs_gpu(structured_tile: NDArray[np.float32]) -> None
 
 @requires_gpu
 @pytest.mark.gpu
-@pytest.mark.parametrize("sigma", [1.0, 2.0])
+@pytest.mark.parametrize("sigma", [0.5, 1.0, 2.0])
 def test_gaussian_laplace_parity_cpu_vs_gpu(
     structured_tile: NDArray[np.float32], sigma: float
 ) -> None:
-    """Parity with a tolerance, because the two operators are not bit-identical.
+    """Both backends must compute the *same* Laplacian-of-Gaussian operator.
 
-    SciPy provides a fused ``gaussian_laplace``; ``cupyx`` has none, so the GPU
-    path composes ``laplace(gaussian_filter(...))``. Same operator, different
-    floating-point ordering.
+    The tolerance is tight because each side calls its own fused
+    Gaussian-second-derivative filter. It would not be achievable with the
+    ``laplace(gaussian_filter(x))`` shim the pipeline script used; see
+    :func:`test_fused_log_differs_materially_from_the_shim_it_replaced`.
     """
     cpu, gpu = NumpyBackend(), CupyBackend()
     expected = cpu.to_numpy(cpu.gaussian_laplace(cpu.to_device(structured_tile), sigma))
     actual = gpu.to_numpy(gpu.gaussian_laplace(gpu.to_device(structured_tile), sigma))
-    assert np.allclose(expected, actual, rtol=1e-4, atol=1e-4)
+    assert np.allclose(expected, actual, rtol=1e-5, atol=1e-6)
+
+
+def test_fused_log_differs_materially_from_the_shim_it_replaced(
+    structured_tile: NDArray[np.float32],
+) -> None:
+    """Regression guard for the operator correction, runnable without a GPU.
+
+    ``bin/image_qc.py`` computed the GPU Laplacian-of-Gaussian as
+    ``laplace(gaussian_filter(x, sigma))`` while the CPU used the fused
+    ``gaussian_laplace``. The two are different discrete operators, so the
+    backends disagreed and the GPU-OOM fallback changed the operator mid-sample.
+
+    This test pins the magnitude of that disagreement at the production
+    ``lap_sigma`` of 1.0. If it ever starts passing trivially -- because SciPy
+    changed an implementation, say -- the justification for the correction needs
+    revisiting, so a *small* difference is the failure here.
+    """
+    from scipy import ndimage
+
+    sigma = 1.0
+    fused = ndimage.gaussian_laplace(structured_tile, sigma=sigma)
+    shim = ndimage.laplace(ndimage.gaussian_filter(structured_tile, sigma=sigma))
+
+    relative_deviation = np.abs(fused - shim).max() / np.abs(fused).max()
+    variance_ratio = shim.var() / fused.var()
+
+    assert relative_deviation > 0.05, (
+        "the two formulations are meant to differ materially; if they no longer "
+        "do, revisit why the GPU backend was switched to the fused operator"
+    )
+    # The shim systematically under-responds, which is what biased GPU focus
+    # scores low relative to CPU ones.
+    assert variance_ratio < 0.95
 
 
 @requires_gpu

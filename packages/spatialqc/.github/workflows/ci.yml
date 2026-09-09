@@ -1,0 +1,132 @@
+---
+# CI for the standalone spatialqc package.
+#
+# This file becomes `.github/workflows/ci.yml` when the package is extracted to
+# its own repository. While it lives inside the pipeline repo it is inert, since
+# GitHub only reads workflows from the repository root.
+name: CI
+
+"on":
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint and type-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install
+        # The lint job needs the extras too: mypy cannot check code whose
+        # third-party imports are absent, and would report import errors as
+        # type errors.
+        run: pip install -e '.[dev,all]'
+      - run: ruff check src tests
+      - run: ruff format --check src tests
+      - run: mypy src/spatialqc
+
+  test:
+    name: Tests (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.11 is what the QC containers pin; the others guard the declared
+        # requires-python floor and the next version we expect to move to.
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install with all extras
+        run: pip install -e '.[dev,all]'
+      - name: Run tests
+        # GPU-marked tests deselect themselves via skipif, but excluding them
+        # explicitly keeps the runner's summary honest about what was covered.
+        run: pytest -m "not gpu" --tb=short
+
+  import-cost:
+    name: Import stays cheap without extras
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install core only (no extras)
+        # The point of the extras split: the package must import, and the
+        # backend module must load, with none of the scientific stack present.
+        run: pip install -e .
+      - name: Import the package and the backend module
+        run: |
+          python -c "import spatialqc; print(spatialqc.__version__)"
+          python -c "import spatialqc.backend as b; print(b.HAS_CUPY)"
+      - name: Fail if a heavy dependency was imported eagerly
+        run: |
+          python - <<'PY'
+          import sys
+          import spatialqc  # noqa: F401
+
+          heavy = [
+              m
+              for m in ("scanpy", "skimage", "sklearn", "seaborn", "tifffile", "zarr", "scipy")
+              if m in sys.modules
+          ]
+          if heavy:
+              raise SystemExit(f"eagerly imported heavy modules: {heavy}")
+          print("import spatialqc is clean")
+          PY
+
+  build:
+    name: Build and verify the wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install build
+      - run: python -m build
+      - name: Verify package data is present in the wheel
+        # A missing threshold YAML is invisible until a consumer installs the
+        # wheel, so assert it here. The repo root of the pipeline this was
+        # extracted from had a blanket `data/` gitignore rule that silently
+        # excluded these files once already.
+        run: |
+          python - <<'PY'
+          import glob
+          import zipfile
+
+          wheel = glob.glob("dist/*.whl")[0]
+          names = zipfile.ZipFile(wheel).namelist()
+          required = [
+              "spatialqc/py.typed",
+              "spatialqc/data/image_qc_thresholds.yaml",
+              "spatialqc/data/transcript_qc_thresholds.yaml",
+          ]
+          missing = [r for r in required if r not in names]
+          if missing:
+              raise SystemExit(f"wheel {wheel} is missing: {missing}")
+          print(f"{wheel} contains all required package data")
+          PY
+      - name: Install the built wheel in a clean env and smoke-test the CLIs
+        run: |
+          python -m venv /tmp/wheeltest
+          /tmp/wheeltest/bin/pip install "$(ls dist/*.whl)[all]"
+          /tmp/wheeltest/bin/spatialqc-image-qc --help > /dev/null
+          /tmp/wheeltest/bin/spatialqc-transcript-qc --help > /dev/null
+          /tmp/wheeltest/bin/python -c "import spatialqc; print(spatialqc.__version__)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
