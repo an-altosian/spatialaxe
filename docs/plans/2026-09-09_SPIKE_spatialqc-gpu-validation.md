@@ -18,7 +18,7 @@ This document records what happened when those paths were finally executed on ha
 | Driver   | 580.159.03                                                |
 | CuPy     | 14.0.1                                                    |
 | Python   | 3.11, env `xenium-test-local`                             |
-| Device   | `CUDA_VISIBLE_DEVICES=0` for all runs                     |
+| Device   | `0` for single-device runs; `0,1,2,3` for the multi-GPU tests |
 
 Note: the sandbox masks `/dev` and `/proc`, so every GPU command must run with the sandbox disabled.
 A sandboxed shell reports `/dev/nvidia*` as *"No such file or directory"* rather than as a permission error, so absence of evidence inside the sandbox is not evidence of absence.
@@ -30,10 +30,15 @@ CUDA_VISIBLE_DEVICES=0 PYTHONPATH=$PWD/src \
   python -m pytest tests/ -n 8 -q
 ```
 
-Result: **245 passed, 1 skipped**, exit 0.
+Result on the tree as reviewed: **245 passed, 1 skipped**, exit 0.
+After the two defect fixes below and their three regression tests: **247 passed, 1 skipped**, with 11 GPU-marked tests.
 
-Of these, **9 GPU-marked tests executed for the first time and all passed** (`pytest -m gpu` reports `9 passed, 236 deselected`).
-The single skip is `tests/test_backend.py:56`, whose skip reason is *"a CUDA device is present"* — it covers the no-CuPy error path and is correctly inactive here.
+Of these, **9 GPU-marked tests executed for the first time and all passed** (`pytest -m gpu` reported `9 passed, 236 deselected`).
+
+Both that run and the review agent's independent `244 passed` were taken with `CUDA_VISIBLE_DEVICES=0`, on the tree *before* the fixes in section 3.
+Neither defect there is reachable on a single device, which is why the two figures agreed and why both looked clean.
+The number that describes the current tree is 247, run with `CUDA_VISIBLE_DEVICES=0,1,2,3`.
+The single skip is `tests/test_backend.py:61`, whose skip reason is *"a CUDA device is present"* — it covers the no-CuPy error path and is correctly inactive here.
 The suite therefore covers both directions; this machine exercises the GPU direction, CI exercises the other.
 
 ## 2. The fused Laplacian-of-Gaussian change (plan section 1)
@@ -132,7 +137,52 @@ What the table does show is that on a sample whose focus/blur bimodality is marg
 
 The risk is therefore **GMM instability on marginal samples**, not a scale shift in the cutoffs.
 
-## 3. What still needs real samples
+## 3. Two defects found in the never-executed GPU code
+
+Both were reproduced on hardware, both are fixed in commit `3c97443`, and **neither is reachable on a single-GPU host** — which is why they survived a review and a green suite.
+
+### 3.1 `CupyBackend` ran its filters on whichever device was current
+
+Only `to_device` entered `with self._device`.
+`uniform_filter`, `laplace`, `gaussian_laplace` and `to_numpy` did not.
+CuPy dispatches to the *current* device, not to the one the array lives on, so the documented multi-GPU pattern gave:
+
+```text
+device 0: OK
+device 1: ValueError: The device where the array resides (1) is
+          different from the current device (0)
+```
+
+All operations now route through one `_on_device` helper rather than four separate wrappings.
+No test had ever passed a non-zero `device_id`.
+
+### 3.2 A caller-side invariant fell out of fixing it
+
+The arrays these methods return live on `device_id`, which is not the current device.
+Touching one with a raw CuPy call outside a device context is an **unrecoverable `cudaErrorIllegalAddress` that aborts the interpreter** — not a catchable exception. With a backend bound to device 1:
+
+| Call                                  | Outcome                          |
+| ------------------------------------- | -------------------------------- |
+| `backend.to_numpy(result).mean()`     | returns normally                 |
+| `float(result.mean())`                | process aborts, no traceback     |
+
+This is now in the `CupyBackend` docstring, and it is the reason section 4.2 of the plan needed correcting: the remaining raw `cp.` sites in `image/qc.py` are **not** device-scoped, and tiles are sharded round-robin across devices (`gpu_ids[slot % len(gpu_ids)]`, `image/qc.py:3215`).
+There is no `cp.cuda.Device` context anywhere between lines 2200 and 3100, yet the `consume()` callbacks in that range knowingly accept device arrays (`isinstance(array, cp.ndarray)`, line 2941).
+On a multi-GPU instance that is a live abort, not a tidiness problem.
+Image QC has in practice received one GPU, where every device id is 0 and the path is unreachable.
+
+### 3.3 `max_gpus=0` meant opposite things
+
+```text
+backend.available_gpu_ids(max_gpus=0)   -> []
+qc.resolve_available_gpus("auto", 0)    -> [0, 1]
+```
+
+`--max-gpus` defaults to `0` and is documented as "use every device", and requesting the CPU is the `device` selector's job — that single control point is precisely why `--max-gpus 0` must not mean "no GPUs".
+`available_gpu_ids` was the outlier and is now aligned.
+`test_backend.py` had enshrined the inverted convention, so it was corrected in the same commit: left as it was, swapping one function for the other during the protocol migration would have made every default run silently CPU-only, which looks like correct output at roughly 50x the cost.
+
+## 4. What still needs real samples
 
 Everything above uses synthetic mosaics: nuclei-like Gaussian blobs, `lap_var` sampled at tile centres as production does (`image/qc.py:5170`), `focus_score` computed per tile as `std**2/mean`.
 Synthetic data establishes direction and mechanism; it cannot establish where a real sample sits relative to an empirically calibrated cutoff.
@@ -154,7 +204,7 @@ python log_gpu_check.py
 python gmm_invariance2.py
 ```
 
-## 4. Environment note for anyone reproducing this
+## 5. Environment note for anyone reproducing this
 
 `xenium-test-local` is missing `esda`, `libpysal` and `nsitk`.
 The unit tests stub all three, so the suite passes without them, but a full end-to-end image QC run needs `nsitk` (`generate_tissue_mask` uses it on the path every run takes) and `esda`/`libpysal` (Moran's I for the negative-probe SNR metric).

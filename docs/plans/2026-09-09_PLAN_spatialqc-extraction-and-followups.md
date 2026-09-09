@@ -129,6 +129,23 @@ It should be done incrementally, one dispatch style at a time, each with before/
 
 `--device` is honoured today at the single point where the analysis decides which GPUs to use (`resolve_available_gpus`), which is sufficient to select and enforce a mode.
 
+> **Correction 2026-09-09, after GPU validation.**
+> The paragraph above is right about *mode selection* and wrong to imply the dispatch styles are merely untidy.
+> It was written by a session with no GPU, so the multi-GPU path had never run.
+>
+> These sites are **not** device-scoped, and that is a live defect on any instance with more than one GPU, not a migration concern:
+>
+> - Tiles are sharded round-robin across devices — `gpu_ids[slot % len(gpu_ids)]` (`image/qc.py:3215`), and again at 3789 and 3908 — so tiles genuinely land on devices 1..N.
+> - `_process_tile_for_consumers` takes `keep_mean_device` / `keep_focus_device` and returns arrays still resident on that device.
+> - Those arrays reach the `consume()` callbacks, which run raw CuPy operations on them — device-array indexing at 2296-2298, `cp.asnumpy` at 2988, `roi_snr_db_batch(st, xp=cp)` at 2997. `grep` confirms **no `cp.cuda.Device` context exists anywhere between lines 2200 and 3100**, and line 2941 (`isinstance(array, cp.ndarray)`) shows these callbacks knowingly accept device arrays.
+> - Reading a device array while another device is current is an unrecoverable `cudaErrorIllegalAddress` that **aborts the interpreter** rather than raising, so the Nextflow task dies with no Python traceback. Reproduced on a 4x L4 host; see F1 in `docs/reviews/2026-09-09_REVIEW_spatialqc-port-gpu.md`.
+>
+> Why it has not been seen: image QC runs under `label 'process_gpu_qc'` and has in practice received one GPU, where every device id is 0 and the bug is unreachable.
+>
+> The `CupyBackend` half of this is fixed (commit `3c97443`); the raw sites in `image/qc.py` are not.
+> **Audit them before any multi-GPU deployment, or pin the analysis to a single device until the migration lands.**
+> The cheapest interim guard is to cap `resolve_available_gpus` at one device, which costs throughput but cannot abort.
+
 ### 4.3 The memory instrumentation is a divergent fork, deliberately left alone
 
 `_log_mem`, `_log_mem_summary`, `_MEM_PEAK` and the `_CGROUP_*` readers exist in both analyses and are **not** copies: the image version logs through `logging` and tracks four figures including a process-tree RSS, the transcript version prints and tracks two, and `_log_mem_summary` shares no lines between them.
