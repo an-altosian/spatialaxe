@@ -8,11 +8,11 @@ skill injection. Skills are therefore authored here, under version control, and 
 
 ## Contents
 
-| Path                                            | Installs to                                          |
-| ----------------------------------------------- | ---------------------------------------------------- |
-| `python-packaging.md`                           | `.claude/skills/python-packaging.md`                 |
-| `evals/python-packaging.json`                   | `.claude/evals/python-packaging.json`                |
-| `evals/trigger-evals/python-packaging.json`     | `.claude/evals/trigger-evals/python-packaging.json`  |
+| Path                                        | Installs to                                         |
+| ------------------------------------------- | --------------------------------------------------- |
+| `python-packaging.md`                       | `.claude/skills/python-packaging.md`                |
+| `evals/python-packaging.json`               | `.claude/evals/python-packaging.json`               |
+| `evals/trigger-evals/python-packaging.json` | `.claude/evals/trigger-evals/python-packaging.json` |
 
 ## Install
 

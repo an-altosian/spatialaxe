@@ -10,10 +10,10 @@ This is the only item that changes numbers, and it should be signed off before r
 
 Image QC computed the Laplacian-of-Gaussian differently on the two backends.
 
-| Backend | Operator                                       | Source                            |
-| ------- | ---------------------------------------------- | --------------------------------- |
-| CPU     | `scipy.ndimage.gaussian_laplace(x, sigma)`     | fused Gaussian second derivative  |
-| GPU     | `laplace(gaussian_filter(x, sigma))`           | hand-written shim, now removed    |
+| Backend | Operator                                   | Source                           |
+| ------- | ------------------------------------------ | -------------------------------- |
+| CPU     | `scipy.ndimage.gaussian_laplace(x, sigma)` | fused Gaussian second derivative |
+| GPU     | `laplace(gaussian_filter(x, sigma))`       | hand-written shim, now removed   |
 
 The shim was introduced with a comment stating that `cupyx` exposes no fused
 `gaussian_laplace`.

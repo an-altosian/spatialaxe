@@ -7,10 +7,10 @@ data and figures that a report can render. It began as two standalone scripts in
 [`nf-core/spatialaxe`](https://github.com/nf-core/spatialaxe) Nextflow pipeline and was extracted into
 a package so that the analysis is installable, importable, testable and versionable on its own.
 
-| Analysis       | Entry point            | What it grades                                                                                                           |
-| -------------- | ---------------------- | ------------------------------------------------------------------------------------------------------------------------ |
-| Image QC       | `run_image_qc`         | Morphology-image focus and contrast maps, per-tile blur classification, stain intensity, signal-to-noise, per-cell texture |
-| Transcript QC  | `run_transcript_qc`    | Per-cell and per-gene count distributions, negative-control probe rates, cell-assignment statistics                       |
+| Analysis      | Entry point         | What it grades                                                                                                             |
+| ------------- | ------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| Image QC      | `run_image_qc`      | Morphology-image focus and contrast maps, per-tile blur classification, stain intensity, signal-to-noise, per-cell texture |
+| Transcript QC | `run_transcript_qc` | Per-cell and per-gene count distributions, negative-control probe rates, cell-assignment statistics                        |
 
 Both analyses run on either a CUDA GPU or the CPU, selected explicitly.
 
@@ -25,14 +25,14 @@ pip install 'spatialqc[all]'          # both
 pip install 'spatialqc[all,gpu]'      # both, with CuPy for CUDA 12
 ```
 
-| Extra               | Pulls in                                                        |
-| ------------------- | --------------------------------------------------------------- |
-| `image`             | scipy, scikit-image, scikit-learn, tifffile, zarr, numba, h5py, matplotlib, seaborn |
+| Extra               | Pulls in                                                                              |
+| ------------------- | ------------------------------------------------------------------------------------- |
+| `image`             | scipy, scikit-image, scikit-learn, tifffile, zarr, numba, h5py, matplotlib, seaborn   |
 | `image-regionprops` | napari-simpleitk-image-processing, napari-skimage-regionprops (per-cell texture only) |
-| `spatial-stats`     | esda, libpysal (Moran's I for the negative-probe SNR metric)     |
-| `transcript`        | scipy, scanpy, anndata, h5py, matplotlib, seaborn                |
-| `gpu`               | cupy-cuda12x                                                     |
-| `dev`               | pytest, pytest-xdist, ruff, mypy, build                          |
+| `spatial-stats`     | esda, libpysal (Moran's I for the negative-probe SNR metric)                          |
+| `transcript`        | scipy, scanpy, anndata, h5py, matplotlib, seaborn                                     |
+| `gpu`               | cupy-cuda12x                                                                          |
+| `dev`               | pytest, pytest-xdist, ruff, mypy, build                                               |
 
 `import spatialqc` itself needs only numpy, pandas, pyarrow, pyyaml and click: the heavy submodules
 load on first attribute access, so importing the package does not pay for a stack you did not ask for.
