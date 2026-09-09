@@ -3,13 +3,14 @@ process TRANSCRIPT_QC_PROCESSING {
     label 'process_high'
 
     conda "${moduleDir}/environment.yml"
-    // Built from environment.yml in this directory (see the module Dockerfile).
-    // Hosted in the Altos Docker Hub namespace; to be migrated to the
-    // nf-core org before release.
-    // 2.0.0 is the first tag that carries the `spatialqc` package and therefore
-    // the `spatialqc-transcript-qc` console script. NOT YET BUILT: docker-profile
-    // tests fail until this image is published.
-    container "altoslabscom/transcript_qc:2.0.0"
+    // Reuses the existing Altos xenium-processing image rather than a
+    // module-specific one, so no new image has to be built or published.
+    // NOTE: this image predates the `spatialqc` package (built 2026-03-30), so
+    // it does not carry the `spatialqc-transcript-qc` console script this
+    // module invokes. Either add the package to the image or install the wheel
+    // in the task before a docker-profile run will succeed; `-stub` is
+    // unaffected. To be migrated to the nf-core org before release.
+    container "altoslabscom/xenium-processing:0.0.11"
 
     input:
     tuple val(meta), val(parameters), path(input_files)
