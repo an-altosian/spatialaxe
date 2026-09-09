@@ -97,12 +97,20 @@ Sequence:
 The package was developed in-tree so the existing test suite could gate every step.
 Extract it with `git subtree split`, which rewrites the commits touching that subdirectory so its contents sit at the repository root:
 
+Split to a **fresh branch name every time** and push that.
+A subtree split is not incremental: re-splitting after new commits produces different SHAs, so a branch left over from an earlier split is stale the moment anything lands in `packages/spatialqc`.
+
 ```bash
-git subtree split --prefix=packages/spatialqc -b spatialqc-standalone
-git push git@github.com:altos-labs/spatialqc.git spatialqc-standalone:main
+# Pick a name that has not been used before -- never reuse an old split branch.
+STAMP=$(date +%Y%m%d%H%M)
+git subtree split --prefix=packages/spatialqc -b "spatialqc-export-$STAMP"
+git push https://github.com/altos-labs/spatialqc.git "spatialqc-export-$STAMP:main"
 ```
 
-This has been run on `feat/spatialqc-package` and verified: the resulting branch has `pyproject.toml`, `README.md`, `LICENSE`, `.gitignore`, `src/`, `tests/` and `.github/workflows/ci.yml` at its root, with both threshold YAMLs and `py.typed` present, and the CI workflow becomes active once it is a repository root.
+Do **not** resurrect a branch called `spatialqc-standalone`.
+One existed from the first split and was already behind the published `main`; pushing it would have been rejected, and force-pushing it would have rolled back the device-scoping and `max_gpus` fixes.
+
+This has been run and verified: the resulting branch has `pyproject.toml`, `README.md`, `LICENSE`, `.gitignore`, `src/`, `tests/` and `.github/workflows/ci.yml` at its root, with both threshold YAMLs and `py.typed` present, and the CI workflow became active once it was a repository root.
 
 One caveat to set expectations: `subtree split` filters by path, so the extracted branch carries only the commits that touched `packages/spatialqc` — four, at the time of writing.
 The scripts' earlier history under `bin/` does **not** follow, because that is a different path.
