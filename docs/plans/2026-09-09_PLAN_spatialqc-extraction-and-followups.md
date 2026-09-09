@@ -6,6 +6,20 @@ This document covers the remaining steps and the decisions that need a human.
 
 ## 1. Decision required: the GPU focus-score change
 
+> **Update 2026-09-09, after GPU validation.**
+> This section was written without GPU access — the machine's `/dev/nvidia*` nodes appeared two minutes after that session ended, so no CuPy branch had ever executed.
+> The paths have now been run on 4x NVIDIA L4 / CuPy 14.0.1.
+> Full numbers: [`2026-09-09_SPIKE_spatialqc-gpu-validation.md`](2026-09-09_SPIKE_spatialqc-gpu-validation.md).
+>
+> What changed in this section's conclusions:
+>
+> - **CPU and GPU now agree to correlation 1.00000000** (max relative deviation 0.0000%). The mixed-scale hazard from the GPU-OOM fallback is closed, confirmed empirically.
+> - **`cupyx.scipy.ndimage.gaussian_laplace` confirmed present** on hardware, so the shim's justifying comment was indeed false.
+> - **The divergence is content-dependent**: ~7% median on nuclei-like (DAPI-like) content versus 25.2% on hard synthetic edges. The table below is a third tile; the three are not corrections of each other.
+> - **The shift is systematically larger on sharp tiles** — `spearman(blur_sigma, log_shift)` = -0.756, -0.740, -0.725 across three seeds. The fused operator therefore *widens* blur/focus separation, which is the safe direction and an argument for the fix on its own merits.
+> - **`lap_focus_corr_warn`/`_fail` and `focus_median_warn` need no attention.** The first moves by at most +0.01; the second gates `focus_score` = `std**2/mean` of raw intensity (`image/qc.py:4608`), which never touches the Laplacian.
+> - **The recommendation below still stands, but the reason has changed.** There is no systematic recalibration factor: the blurry-fraction delta across three seeds was -14.58, +2.08 and -0.69 pp — inconsistent in sign. The real risk is GMM *instability* on samples whose bimodality is marginal, where a ~15 pp swing is possible and `focus_warn` is 0.40. Also check `pct_blurred_gmm_2d_roi_warn: 20.0`, which is downstream of the same fraction.
+
 This is the only item that changes numbers, and it should be signed off before release.
 
 Image QC computed the Laplacian-of-Gaussian differently on the two backends.
