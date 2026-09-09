@@ -9,12 +9,13 @@ process IMAGE_QC_ANALYSIS {
     conda "${moduleDir}/environment.yml"
     // Reuses the existing Altos xenium-processing GPU image rather than a
     // module-specific one, so no new image has to be built or published.
-    // NOTE: this image predates the `spatialqc` package (built 2026-03-30), so
-    // it does not carry the `spatialqc-image-qc` console script this module
-    // invokes. Either add the package to the image or install the wheel in the
-    // task before a docker-profile run will succeed; `-stub` is unaffected.
+    // 0.0.16 == 0.0.15 plus the `spatialqc` wheel installed into the image's
+    // python3.11 site-packages, with the `spatialqc-image-qc` console script on
+    // PATH. Added as a pure file-copy layer, since the wheel is py3-none-any and
+    // needs no build step. 0.0.15 already carried every dependency (scanpy,
+    // tifffile, cupy, zarr, numba, nsitk, skimage, sklearn, quarto).
     // To be migrated to the nf-core org before release.
-    container "altoslabscom/xenium-processing-gpu:0.0.15"
+    container "altoslabscom/xenium-processing-gpu:0.0.16"
 
     input:
     tuple val(meta), val(parameters), path(input_files)

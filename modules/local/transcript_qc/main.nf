@@ -5,12 +5,13 @@ process TRANSCRIPT_QC_PROCESSING {
     conda "${moduleDir}/environment.yml"
     // Reuses the existing Altos xenium-processing image rather than a
     // module-specific one, so no new image has to be built or published.
-    // NOTE: this image predates the `spatialqc` package (built 2026-03-30), so
-    // it does not carry the `spatialqc-transcript-qc` console script this
-    // module invokes. Either add the package to the image or install the wheel
-    // in the task before a docker-profile run will succeed; `-stub` is
-    // unaffected. To be migrated to the nf-core org before release.
-    container "altoslabscom/xenium-processing:0.0.11"
+    // 0.0.12 == 0.0.11 plus the `spatialqc` wheel installed into the image's
+    // python3.11 site-packages, with the `spatialqc-transcript-qc` console
+    // script on PATH. Added as a pure file-copy layer, since the wheel is
+    // py3-none-any and needs no build step. 0.0.11 already carried every
+    // dependency (scanpy, anndata, pyarrow, h5py, scipy, seaborn, quarto).
+    // To be migrated to the nf-core org before release.
+    container "altoslabscom/xenium-processing:0.0.12"
 
     input:
     tuple val(meta), val(parameters), path(input_files)
