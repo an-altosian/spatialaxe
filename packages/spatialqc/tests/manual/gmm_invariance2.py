@@ -123,8 +123,6 @@ def blurry_fraction(focus, inten, lap_var):
     )
     gmm, blur_idx = fit_focus_gmm_2d(df, focus_col_name="dapi_focus_score")
     out = classify_roi_blur_2d(df, gmm, blur_idx, focus_col_name="dapi_focus_score")
-    if isinstance(out, tuple):
-        out = out[0]
     return out[BLUR_COL].to_numpy().astype(bool)
 
 

@@ -1057,7 +1057,7 @@ def compute_roi_snr(
     ``roi_grid_stride`` should match the grid used in ``image_qc.py`` (typically
     ``(roi_size, roi_size)`` when stride defaults to roi_size).
     """
-    if (df_tx is None) == (transcripts_path is None):
+    if df_tx is not None and transcripts_path is not None:
         raise ValueError("pass exactly one of df_tx or transcripts_path")
 
     df = df_grid_roi
@@ -1089,12 +1089,7 @@ def compute_roi_snr(
             batch_rows=batch_rows,
             roi_id_is_arange=roi_id_is_arange,
         )
-    else:
-        # The XOR check at the top of the function already guarantees this:
-        # transcripts_path is None here, so df_tx cannot be. mypy cannot follow
-        # the invariant through that check, and the alternative -- annotating
-        # df_tx as non-optional -- would be a lie about the signature.
-        assert df_tx is not None
+    elif df_tx is not None:
         counters = (
             np.zeros(n_rois, dtype=np.int64),
             np.zeros(n_rois, dtype=np.int64),
@@ -1112,6 +1107,9 @@ def compute_roi_snr(
             is_excluded=_excluded_mask_for_column(df_tx["feature_name"]),
         )
         n_used = int(len(df_tx))
+    else:
+        raise ValueError("pass exactly one of df_tx or transcripts_path")
+
     real_c, neg_c, total_c = counters
 
     df["snr_real_tx"] = real_c
