@@ -1,0 +1,18 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.venv/
+
+# The repository root .gitignore has a blanket `data/` rule for pipeline test
+# data, which would otherwise swallow this package's threshold YAMLs. They are
+# declared package-data and must ship inside the wheel, so re-include them.
+!src/spatialqc/data/
+!src/spatialqc/data/*.yaml

@@ -1,0 +1,210 @@
+{
+  "skill_name": "python-packaging",
+  "category": "capability_uplift",
+  "evals": [
+    {
+      "id": 1,
+      "name": "name-coherence-dist-vs-import",
+      "prompt": "Our helper package's pyproject.toml says name = \"spatialbench\" but the directory under src/ is xenium_helpers, so pip install spatialbench then import xenium_helpers. Three other repos already import xenium_helpers. Fix the packaging.",
+      "expected_output": "Identifies the distribution-name/import-name mismatch as the defect. Chooses one coherent pair (kebab-case dist name, snake_case import name, same word) and, because downstream consumers import the old name, adds an explicit deprecation shim module that re-exports and warns rather than silently breaking them. Notes the stray spatialbench.egg-info as the symptom.",
+      "assertions": [
+        {
+          "text": "Explicitly names the distribution-name vs import-name mismatch as the root defect",
+          "critical": true
+        },
+        {
+          "text": "Makes dist name and import name coherent (e.g. spatial-qc / spatialqc) rather than leaving the drift",
+          "critical": true
+        },
+        {
+          "text": "Provides a compatibility shim re-exporting the old import name with a DeprecationWarning, because other repos import it",
+          "critical": true
+        },
+        {
+          "text": "Mentions the stray <other>.egg-info directory or failing pip uninstall as evidence of the mismatch",
+          "critical": false
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "name": "src-layout-and-conftest-path-hack",
+      "prompt": "Our tests import the code with sys.path.insert(0, str(Path(__file__).parent.parent)) in conftest.py. They pass serially but fail under pytest-xdist. Restructure so this is not needed.",
+      "expected_output": "Diagnoses the sys.path hack as evidence the code is not installable and that collection order is load-bearing. Moves to src/ layout, adds pyproject.toml, installs with pip install -e '.[dev]', and deletes the sys.path manipulation from conftest.py entirely.",
+      "assertions": [
+        {
+          "text": "Adopts src/ layout so the package cannot be imported without being installed",
+          "critical": true
+        },
+        {
+          "text": "Deletes the sys.path.insert from conftest.py rather than refining it",
+          "critical": true
+        },
+        {
+          "text": "Uses an editable install (pip install -e) as the mechanism that replaces the path hack",
+          "critical": true
+        },
+        {
+          "text": "Explains that the path hack made test collection order load-bearing, which is why xdist failed",
+          "critical": false
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "name": "extras-not-fat-dependency-list",
+      "prompt": "This package's [project] dependencies lists 20 packages including harmonypy, opencv-python, loompy and symphonypy, but the QC code only imports numpy, pandas, pyarrow, scikit-image, tifffile, zarr, scanpy and anndata. Container builds keep failing on unrelated solver conflicts. Restructure the dependencies.",
+      "expected_output": "Reduces [project] dependencies to the thin core actually imported unconditionally (numpy/pandas/pyarrow) and moves feature-specific packages into named optional-dependencies extras (image, transcript, gpu, dev). Drops the packages that are never imported. Recommends auditing each declared dependency against an actual grep for its import.",
+      "assertions": [
+        {
+          "text": "Moves feature-specific dependencies into [project.optional-dependencies] extras instead of core dependencies",
+          "critical": true
+        },
+        {
+          "text": "Removes dependencies that the code never imports (harmonypy, opencv-python, loompy, symphonypy)",
+          "critical": true
+        },
+        {
+          "text": "Keeps only unconditionally-imported packages in [project] dependencies",
+          "critical": true
+        },
+        {
+          "text": "Recommends verifying each declared dependency corresponds to a real import",
+          "critical": false
+        },
+        {
+          "text": "Adds upper version bounds only with a comment explaining the known incompatibility",
+          "critical": false
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "name": "gpu-cpu-backend-no-silent-fallback",
+      "prompt": "Our image analysis package has if use_gpu: cupy_uniform_filter(...) else: scipy_uniform_filter(...) branches scattered through eight functions. We run on both GPU nodes and CPU-only nodes and want each to be efficient. Design the backend layer.",
+      "expected_output": "Introduces a single Backend Protocol with NumpyBackend and CupyBackend implementations, resolved once by a get_backend(device) factory taking auto/cpu/gpu. cupy is imported in exactly one guarded module. device='gpu' without CuPy raises rather than falling back silently. Each backend uses native primitives (cupyx.scipy.ndimage vs scipy.ndimage plus numba), transfers happen at the edges, and a skipif-guarded parity test asserts both backends agree.",
+      "assertions": [
+        {
+          "text": "Defines a single backend abstraction (Protocol/ABC) with separate CPU and GPU implementations",
+          "critical": true
+        },
+        {
+          "text": "Resolves the backend once via a factory taking an explicit device selector, replacing scattered if use_gpu branches",
+          "critical": true
+        },
+        {
+          "text": "Raises an error when GPU is explicitly requested but CuPy/CUDA is unavailable, rather than silently using CPU",
+          "critical": true
+        },
+        {
+          "text": "Each backend uses its native primitives rather than emulating the other",
+          "critical": true
+        },
+        {
+          "text": "Adds a CPU-vs-GPU numerical parity test guarded by skipif when CuPy is absent",
+          "critical": false
+        },
+        {
+          "text": "Confines the cupy import to one guarded module",
+          "critical": false
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "name": "package-data-via-importlib-resources",
+      "prompt": "Our package needs to ship a default thresholds YAML. Right now the code does Path(__file__).parent.parent / 'conf' / 'thresholds.yaml', which breaks when installed from a wheel. Callers must still be able to pass their own file.",
+      "expected_output": "Moves the YAML inside the package (e.g. src/<pkg>/data/), declares it via [tool.setuptools.package-data], and reads it with importlib.resources.files(...). Implements a packaged-default / caller-override signature where path=None loads the packaged file. Suggests verifying the wheel contains the YAML.",
+      "assertions": [
+        {
+          "text": "Relocates the data file inside the package directory and declares it as package-data in pyproject.toml",
+          "critical": true
+        },
+        {
+          "text": "Reads the file with importlib.resources rather than a __file__-relative path",
+          "critical": true
+        },
+        {
+          "text": "Keeps a caller override so path=None loads the packaged default",
+          "critical": true
+        },
+        {
+          "text": "Suggests inspecting the built wheel to confirm the data file is included",
+          "critical": false
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "name": "console-scripts-replace-bin-scripts",
+      "prompt": "Our Nextflow pipeline calls image_qc.py from bin/, which must be chmod 755 and copied into the container. Convert this to a proper installable entry point without breaking the pipeline module.",
+      "expected_output": "Adds a [project.scripts] console script mapping to a thin CLI module, so pip install puts it on PATH and the chmod-755 requirement disappears. Keeps every CLI flag name byte-identical so the Nextflow module changes only the command token. Keeps the CLI thin (parse, call one library function) and reports the package version through the versions topic channel dynamically.",
+      "assertions": [
+        {
+          "text": "Declares a [project.scripts] console-script entry point instead of a chmod-755 bin script",
+          "critical": true
+        },
+        {
+          "text": "Keeps CLI flag names unchanged so the pipeline caller only swaps the command name",
+          "critical": true
+        },
+        {
+          "text": "Keeps the CLI layer thin, delegating to an importable library function",
+          "critical": true
+        },
+        {
+          "text": "Reports the package version dynamically rather than hardcoding it",
+          "critical": false
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "name": "single-source-version",
+      "prompt": "Our pyproject.toml says version = \"0.1.4\" and src/pkg/__init__.py says __version__ = \"0.1.2\". Make the version authoritative in one place and readable at runtime.",
+      "expected_output": "Single-sources the version, either via dynamic version with [tool.setuptools.dynamic] attr pointing at the package attribute, or by reading importlib.metadata.version() at runtime with a PackageNotFoundError fallback for source trees. Removes the duplicate declaration.",
+      "assertions": [
+        {
+          "text": "Eliminates the duplicate version declaration so only one place is authoritative",
+          "critical": true
+        },
+        {
+          "text": "Uses dynamic version metadata or importlib.metadata rather than two hardcoded strings",
+          "critical": true
+        },
+        {
+          "text": "Handles the source-tree / not-installed case when reading installed metadata",
+          "critical": false
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "name": "port-order-of-operations",
+      "prompt": "We have a 14000-line image_qc.py and a 1600-line transcript_qc.py that we want to turn into a well-structured installable package with proper submodules. There is no real-data regression suite, only unit tests. Plan the port.",
+      "expected_output": "Sequences the port: run the existing tests for a green baseline first, scaffold pyproject and src layout, move the scripts in verbatim as single modules, port the tests and get green, and only then split along seams with tests re-run after each split. Warns that module-level globals are where splits change behavior, applies ruff mechanical modernization last, and explicitly declines to hand-rewrite numerical function bodies given no regression suite.",
+      "assertions": [
+        {
+          "text": "Establishes a green test baseline before moving any code",
+          "critical": true
+        },
+        {
+          "text": "Moves files verbatim first and defers splitting into submodules until tests pass in the new location",
+          "critical": true
+        },
+        {
+          "text": "Declines to semantically rewrite numerical function bodies, stating the validation limit explicitly",
+          "critical": true
+        },
+        {
+          "text": "Flags module-level globals (locks, caches, HAS_* flags) as the risk when splitting",
+          "critical": false
+        },
+        {
+          "text": "Defers mechanical ruff modernization to a final, semantically inert pass",
+          "critical": false
+        }
+      ]
+    }
+  ]
+}

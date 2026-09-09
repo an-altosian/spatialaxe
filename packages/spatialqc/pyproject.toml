@@ -1,0 +1,158 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+# Distribution name and import name are deliberately the same word, so
+# `pip install spatialqc` gives `import spatialqc`. The package this supersedes
+# shipped `name = "spatialbench"` while exporting `xenium_helpers`, which left a
+# stray egg-info and made the distribution impossible to pin correctly.
+name = "spatialqc"
+description = "Quality-control analytics for 10x Genomics Xenium spatial transcriptomics runs"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [{ name = "Altos Labs" }]
+maintainers = [{ name = "Dongze He", email = "dhe@altoslabs.com" }]
+keywords = ["xenium", "spatial-transcriptomics", "quality-control", "imaging"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Bio-Informatics",
+  "Typing :: Typed",
+]
+# Single-sourced from spatialqc.__version__ (RULE P2): never duplicated here.
+dynamic = ["version"]
+
+# Core dependencies are only what `import spatialqc` needs unconditionally:
+# the bundle readers, the threshold loader and the CLI shell. Everything
+# feature-specific lives in an extra so a consumer that only needs transcript QC
+# does not solve for the imaging stack.
+dependencies = [
+  "numpy>=2.0",
+  "pandas>=2.2",
+  "pyarrow>=18",
+  "pyyaml>=6.0",
+  "click>=8.1",
+]
+
+[project.optional-dependencies]
+# Image QC: morphology TIFF/zarr readers, focus + SNR maps, figure rendering.
+image = [
+  "scipy>=1.14",
+  "scikit-image>=0.24",
+  "scikit-learn>=1.5",
+  "tifffile>=2024.9",
+  "imagecodecs>=2024.9",
+  # zarr 3.x reworked the Group/open API that spatialqc.image.io relies on.
+  "zarr>=2.18,<3",
+  "numba>=0.60",
+  "h5py>=3.11",
+  "matplotlib>=3.9",
+  "seaborn>=0.13",
+]
+# Optional napari plugins used only by the per-cell texture/regionprops path.
+# Split out because they drag in a vispy/OpenGL stack that headless CI does not
+# need and that conflicts with minimal container images.
+image-regionprops = [
+  "napari-simpleitk-image-processing>=0.4.9",
+  "napari-skimage-regionprops>=0.10.1",
+]
+# Spatial autocorrelation (Moran's I) for the negative-probe SNR metric.
+spatial-stats = ["esda>=2.5", "libpysal>=4.9"]
+# Transcript QC: cell-feature-matrix reading and per-cell summaries.
+transcript = [
+  "scipy>=1.14",
+  "scanpy>=1.10",
+  "anndata>=0.11",
+  "h5py>=3.11",
+  "matplotlib>=3.9",
+  "seaborn>=0.13",
+]
+# GPU acceleration. Never a hard dependency: spatialqc.backend imports cupy
+# behind a guard, and `--device gpu` raises rather than falling back silently.
+gpu = ["cupy-cuda12x>=13"]
+dev = [
+  "pytest>=7.0",
+  "pytest-xdist>=3.0",
+  "ruff>=0.9",
+  "mypy>=1.0",
+  "build>=1.0",
+]
+all = ["spatialqc[image,image-regionprops,spatial-stats,transcript]"]
+
+[project.urls]
+Homepage = "https://github.com/altos-labs/spatialqc"
+Repository = "https://github.com/altos-labs/spatialqc"
+Issues = "https://github.com/altos-labs/spatialqc/issues"
+
+[project.scripts]
+# Console scripts replace the chmod-755 `bin/*.py` pattern: pip puts these on
+# PATH, so a Nextflow module swaps one command token and nothing else.
+spatialqc-image-qc = "spatialqc.cli.image_qc:main"
+spatialqc-transcript-qc = "spatialqc.cli.transcript_qc:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "spatialqc.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+# Default threshold YAMLs and the PEP 561 typing marker must travel in the wheel.
+spatialqc = ["py.typed", "data/*.yaml"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "C4", "UP", "SIM"]
+ignore = [
+  "E501",   # line length is handled by the formatter
+  "B008",   # click decorators legitimately call functions in defaults
+  "C901",   # the ported QC pipelines have inherently long orchestrators
+  "SIM108", # ternaries are not always clearer in numeric code
+]
+
+[tool.ruff.lint.per-file-ignores]
+# The ported QC modules keep upstream structure verbatim; flagging their
+# complexity would only produce noise we have agreed not to act on.
+"src/spatialqc/image/qc.py" = ["B", "SIM", "E741"]
+"src/spatialqc/transcript/qc.py" = ["B", "SIM", "E741"]
+"tests/*" = ["B011"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-q --tb=short"
+markers = [
+  "gpu: requires a CUDA device and CuPy (deselect with '-m \"not gpu\"')",
+]
+
+[tool.mypy]
+python_version = "3.10"
+warn_unused_configs = true
+ignore_missing_imports = true
+# The ported numerical modules are not annotated end-to-end yet; the public API
+# surface in __init__.py, backend.py and utils.py is.
+disable_error_code = ["var-annotated", "assignment"]
+
+[[tool.mypy.overrides]]
+module = ["spatialqc.image.qc", "spatialqc.transcript.qc"]
+ignore_errors = true
+
+[tool.coverage.run]
+source = ["src/spatialqc"]
+branch = true

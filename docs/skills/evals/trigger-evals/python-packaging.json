@@ -1,0 +1,82 @@
+[
+  {
+    "query": "Turn these three analysis scripts into an installable Python package",
+    "should_trigger": true
+  },
+  {
+    "query": "Why can't my tests import the package without a sys.path hack in conftest.py?",
+    "should_trigger": true
+  },
+  {
+    "query": "Should this dependency go in [project] dependencies or an optional extra?",
+    "should_trigger": true
+  },
+  {
+    "query": "My pyproject.toml name doesn't match the directory under src/ - is that a problem?",
+    "should_trigger": true
+  },
+  {
+    "query": "How do I ship a default YAML config file inside the wheel?",
+    "should_trigger": true
+  },
+  {
+    "query": "Add an optional cupy GPU dependency that degrades to CPU when unavailable",
+    "should_trigger": true
+  },
+  {
+    "query": "Replace our chmod 755 bin scripts with proper console_scripts entry points",
+    "should_trigger": true
+  },
+  {
+    "query": "The version in __init__.py and pyproject.toml have drifted apart",
+    "should_trigger": true
+  },
+  {
+    "query": "Build a wheel and verify it contains the package data before publishing",
+    "should_trigger": true
+  },
+  {
+    "query": "Pin this internal package to an exact version in the container environment.yml",
+    "should_trigger": true
+  },
+  {
+    "query": "Design a CPU and GPU backend abstraction for our image filters",
+    "should_trigger": true
+  },
+  {
+    "query": "Split this 14000-line module into submodules as an installable library",
+    "should_trigger": true
+  },
+  {
+    "query": "How do I read a pandas DataFrame from a parquet file?",
+    "should_trigger": false
+  },
+  {
+    "query": "Write a TypedDict for this function's return value",
+    "should_trigger": false
+  },
+  {
+    "query": "Add a pytest fixture that generates a synthetic DataFrame",
+    "should_trigger": false
+  },
+  {
+    "query": "Create a Nextflow module that runs samtools sort",
+    "should_trigger": false
+  },
+  {
+    "query": "Set up an R package with testthat for unit testing",
+    "should_trigger": false
+  },
+  {
+    "query": "Fix this off-by-one error in the tile loop",
+    "should_trigger": false
+  },
+  {
+    "query": "Launch the pipeline on Seqera Platform with the test profile",
+    "should_trigger": false
+  },
+  {
+    "query": "Why is my GMM fit not converging on this focus score distribution?",
+    "should_trigger": false
+  }
+]
