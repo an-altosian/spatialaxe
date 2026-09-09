@@ -169,8 +169,16 @@ Note also that `transcript_qc_thresholds.yaml` is read only by the report notebo
 
 `spatialqc.backend` is the designed interface and is used by the new code, but the ported analysis still dispatches internally in three different styles: a `_get_backend` tuple factory, direct `cp.` calls under `cp.cuda.Device(gpu_id)`, and array-type inference via `_is_device_array` / `_device_or_host` with no flag threaded through.
 
-Unifying them is a semantic change to numerical code and needs a real-data regression suite to validate, which does not exist.
+Unifying them is a semantic change to numerical code and needs a real-data regression suite to validate.
 It should be done incrementally, one dispatch style at a time, each with before/after metrics on a real bundle.
+
+> **Update 2026-09-09.** That regression suite now exists, so the blocker on this item is gone — only the work itself remains.
+>
+> - `tests/manual/real_calibration.py` gives before/after metrics on a real bundle, which is exactly what this item asked for.
+> - `tests/test_multi_gpu_tiled.py` pins the device invariant and bit-identity of results across cards.
+> - `tests/manual/log_gpu_check.py` pins CPU/GPU numerical agreement.
+>
+> The device-correctness half of this item is already fixed (`3c97443`, `9771f53`); what is left is the cosmetic-but-real work of putting the three dispatch styles behind the one `Backend` protocol.
 
 `--device` is honoured today at the single point where the analysis decides which GPUs to use (`resolve_available_gpus`), which is sufficient to select and enforce a mode.
 
@@ -178,18 +186,32 @@ It should be done incrementally, one dispatch style at a time, each with before/
 > The paragraph above is right about *mode selection* and wrong to imply the dispatch styles are merely untidy.
 > It was written by a session with no GPU, so the multi-GPU path had never run.
 >
-> These sites are **not** device-scoped, and that is a live defect on any instance with more than one GPU, not a migration concern:
+> **FIXED in `9771f53`. And a correction to my own first account of it, which over-claimed.**
+>
+> I first described these sites as a live abort that would kill a multi-GPU task. Measured on two L4s, that is wrong — the mismatch is real but **latent**. Instrumenting `RoiOtsuSnrAccumulator.consume` on the real tiled path, pre-fix:
+>
+> ```text
+> consume() calls : 4      arrays on devices {0, 1}
+> current device  : {0}    mismatches: 3 of 4
+> ```
+>
+> So the fold really was handed a foreign-device array on 3 of 4 tiles, and it really did not crash. Of the four consumers, three defend themselves: `CentrePixelSampler` (2295) and `LabeledSumAccumulator` (2506) open `with array.device:` before gathering, and `BlockMeanAccumulator` never touches CuPy. Only `RoiOtsuSnrAccumulator` has no device context — but the operations it performs on the foreign array are `cp.asnumpy`, which CuPy resolves cross-device.
+>
+> Worth fixing anyway: the fold is one elementwise kernel or fancy index away from `cudaErrorIllegalAddress`, which aborts the interpreter rather than raising — a task death with no Python traceback and no failed assertion to find. And `_run_tile`'s own `finally` comment already asserts *"the fold runs on this card"*, which simply was not true.
+>
+> The mechanism, which stands as described:
 >
 > - Tiles are sharded round-robin across devices — `gpu_ids[slot % len(gpu_ids)]` (`image/qc.py:3215`), and again at 3789 and 3908 — so tiles genuinely land on devices 1..N.
-> - `_process_tile_for_consumers` takes `keep_mean_device` / `keep_focus_device` and returns arrays still resident on that device.
-> - Those arrays reach the `consume()` callbacks, which run raw CuPy operations on them — device-array indexing at 2296-2298, `cp.asnumpy` at 2988, `roi_snr_db_batch(st, xp=cp)` at 2997. `grep` confirms **no `cp.cuda.Device` context exists anywhere between lines 2200 and 3100**, and line 2941 (`isinstance(array, cp.ndarray)`) shows these callbacks knowingly accept device arrays.
-> - Reading a device array while another device is current is an unrecoverable `cudaErrorIllegalAddress` that **aborts the interpreter** rather than raising, so the Nextflow task dies with no Python traceback. Reproduced on a 4x L4 host; see F1 in `docs/reviews/2026-09-09_REVIEW_spatialqc-port-gpu.md`.
+> - `_process_tile_for_consumers` takes `keep_mean_device` / `keep_focus_device` and returns arrays still resident on that device; consumers opt in via `wants_device_mean` / `wants_device_focus`.
+> - The fold then ran with device 0 current.
 >
-> Why it has not been seen: image QC runs under `label 'process_gpu_qc'` and has in practice received one GPU, where every device id is 0 and the bug is unreachable.
+> The fix binds the worker thread to `gpu_id` for the whole tile, compute and fold alike, so the unscoped consumer is corrected at the boundary without touching its ten call sites. The other three consumers' inner contexts become redundant but harmless, and CUDA's current device is per-thread so the workers stay independent. Post-fix the same instrumentation reports current device `{0, 1}` and **zero** mismatches.
 >
-> The `CupyBackend` half of this is fixed (commit `3c97443`); the raw sites in `image/qc.py` are not.
-> **Audit them before any multi-GPU deployment, or pin the analysis to a single device until the migration lands.**
-> The cheapest interim guard is to cap `resolve_available_gpus` at one device, which costs throughput but cannot abort.
+> `tests/test_multi_gpu_tiled.py` asserts the invariant rather than waiting for a crash, since the crash does not currently happen. Verified to discriminate: 3 passed with the fix; reverted, `AssertionError: 3/4 folds ran on the wrong card (array device, current device): [(1, 0), (1, 0), (1, 0)]`. It also asserts the sharding spread over more than one card, so it cannot pass vacuously — an earlier draft passed both with and without the fix and proved nothing.
+>
+> Why it was never seen in production: image QC runs under `label 'process_gpu_qc'` and has in practice received one GPU, where every device id is 0 and the mismatch cannot arise.
+>
+> The `CupyBackend` half was fixed earlier in `3c97443`. **No interim `--max-gpus 1` guard is needed any more**, though it remains a valid way to reduce multi-GPU surface area if you want it.
 
 ### 4.3 The memory instrumentation is a divergent fork, deliberately left alone
 

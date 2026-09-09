@@ -166,10 +166,17 @@ Touching one with a raw CuPy call outside a device context is an **unrecoverable
 | `backend.to_numpy(result).mean()`     | returns normally                 |
 | `float(result.mean())`                | process aborts, no traceback     |
 
-This is now in the `CupyBackend` docstring, and it is the reason section 4.2 of the plan needed correcting: the remaining raw `cp.` sites in `image/qc.py` are **not** device-scoped, and tiles are sharded round-robin across devices (`gpu_ids[slot % len(gpu_ids)]`, `image/qc.py:3215`).
-There is no `cp.cuda.Device` context anywhere between lines 2200 and 3100, yet the `consume()` callbacks in that range knowingly accept device arrays (`isinstance(array, cp.ndarray)`, line 2941).
-On a multi-GPU instance that is a live abort, not a tidiness problem.
-Image QC has in practice received one GPU, where every device id is 0 and the path is unreachable.
+The table above is the `CupyBackend` case, where the abort is real and reproduced.
+
+I then generalised it to `image/qc.py` and **that was an over-claim**, corrected here.
+Tiles are indeed sharded round-robin across devices (`gpu_ids[slot % len(gpu_ids)]`, `image/qc.py:3215`) and the fold did run with the wrong device current — instrumenting the real tiled path on two L4s showed arrays on devices `{0, 1}` against a current device of `{0}`, a mismatch on **3 of 4 tiles**.
+But it did not abort. Three of the four consumers scope themselves — `CentrePixelSampler` (2295) and `LabeledSumAccumulator` (2506) open `with array.device:`, and `BlockMeanAccumulator` never touches CuPy — and the fourth, `RoiOtsuSnrAccumulator`, only calls `cp.asnumpy` on the foreign array, which CuPy resolves cross-device.
+
+So it was a **latent** mismatch, not a live task death: one elementwise kernel or fancy index away from the abort, with no exception to catch when it arrives.
+Fixed in `9771f53` by binding each worker thread to its tile's card for the whole tile, which corrects the unscoped consumer at the boundary rather than at its ten call sites.
+Post-fix the same instrumentation reports current device `{0, 1}` and zero mismatches, and `tests/test_multi_gpu_tiled.py` pins the invariant — verified to fail when the fix is reverted.
+
+Image QC has in practice received one GPU, where every device id is 0 and the mismatch cannot arise, which is why nothing ever surfaced.
 
 ### 3.3 `max_gpus=0` meant opposite things
 
