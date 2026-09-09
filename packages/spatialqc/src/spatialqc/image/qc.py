@@ -3625,40 +3625,54 @@ def _compute_channel_maps_tiled(
         def _run_tile(spec) -> tuple[int, float, float]:
             gpu_id = gpu_pool.get()
             try:
-                t0 = time.perf_counter()
-                trimmed, untrimmed = _process_tile_for_consumers(
-                    channel_data,
-                    spec,
-                    window_size,
-                    gpu_id,
-                    include_laplacian,
-                    lap_sigma,
-                    keep_mean_device=keep_mean_device,
-                    keep_focus_device=keep_focus_device,
-                    drop_mean_host=drop_mean_host,
-                )
-                compute_seconds = time.perf_counter() - t0
+                # Bind this worker thread to its card for the WHOLE tile, compute
+                # and fold alike. CuPy dispatches to whichever device is current in
+                # the calling thread, not to the one an array lives on, so without
+                # this the fold below reduces device arrays that live on `gpu_id`
+                # while device 0 is current -- an unrecoverable
+                # cudaErrorIllegalAddress that aborts the interpreter rather than
+                # raising, killing the task with no Python traceback. The `finally`
+                # note below already asserts "the fold runs on this card"; this is
+                # what makes that true. Unreachable with one GPU, where every id is
+                # 0, which is why it survived review and a green suite.
+                # The inner contexts in _process_tile_for_consumers are then
+                # no-ops, and CUDA's current device is per-thread, so the n_gpus
+                # workers stay independent.
+                with cp.cuda.Device(gpu_id):
+                    t0 = time.perf_counter()
+                    trimmed, untrimmed = _process_tile_for_consumers(
+                        channel_data,
+                        spec,
+                        window_size,
+                        gpu_id,
+                        include_laplacian,
+                        lap_sigma,
+                        keep_mean_device=keep_mean_device,
+                        keep_focus_device=keep_focus_device,
+                        drop_mean_host=drop_mean_host,
+                    )
+                    compute_seconds = time.perf_counter() - t0
 
-                # Fold into THIS thread's own consumer set -- no lock, so the n_gpus
-                # workers fold concurrently.
-                local_consumers = _thread_consumers()
-                t1 = time.perf_counter()
-                local_per: dict[str, float] = {}
-                for consumer in local_consumers:
-                    t_c = time.perf_counter()
-                    if getattr(consumer, "wants_untrimmed", False):
-                        consumer.consume(spec, untrimmed)
-                    else:
-                        consumer.consume(spec, trimmed)
-                    name = type(consumer).__name__
-                    local_per[name] = local_per.get(name, 0.0) + (time.perf_counter() - t_c)
-                fold = time.perf_counter() - t1
+                    # Fold into THIS thread's own consumer set -- no lock, so the
+                    # n_gpus workers fold concurrently.
+                    local_consumers = _thread_consumers()
+                    t1 = time.perf_counter()
+                    local_per: dict[str, float] = {}
+                    for consumer in local_consumers:
+                        t_c = time.perf_counter()
+                        if getattr(consumer, "wants_untrimmed", False):
+                            consumer.consume(spec, untrimmed)
+                        else:
+                            consumer.consume(spec, trimmed)
+                        name = type(consumer).__name__
+                        local_per[name] = local_per.get(name, 0.0) + (time.perf_counter() - t_c)
+                    fold = time.perf_counter() - t1
+                    del trimmed, untrimmed
                 # Aggregate the per-consumer fold time across threads (these overlap
                 # in wall clock now, so this is summed CPU, not wall time).
                 with per_consumer_lock:
                     for name, seconds in local_per.items():
                         per_consumer[name] = per_consumer.get(name, 0.0) + seconds
-                del trimmed, untrimmed
                 return gpu_id, compute_seconds, fold
             finally:
                 # Release the GPU slot AFTER the fold, not before it. With
