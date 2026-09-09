@@ -35,4 +35,7 @@ dependencies:
       # The QC analysis itself. Pinned exactly so a pipeline commit reproduces a
       # run. The scientific stack it needs is installed above by conda, so pip
       # resolves the `transcript` extra as already satisfied.
-      - spatialqc[transcript]==0.1.0
+      # spatialqc itself is NOT installed here. It is deliberately unpublished,
+      # so the Dockerfile installs it from a locally built wheel instead. Every
+      # dependency of the extras it needs is pinned by conda above, which is why
+      # that install can use --no-deps.

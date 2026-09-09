@@ -4,12 +4,12 @@ process TRANSCRIPT_QC_PROCESSING {
 
     conda "${moduleDir}/environment.yml"
     // Built from environment.yml in this directory (see the module Dockerfile).
-    // Hosted on the author's quay.io namespace for now; to be migrated to the
+    // Hosted in the Altos Docker Hub namespace; to be migrated to the
     // nf-core org before release.
     // 2.0.0 is the first tag that carries the `spatialqc` package and therefore
     // the `spatialqc-transcript-qc` console script. NOT YET BUILT: docker-profile
     // tests fail until this image is published.
-    container "quay.io/dongzehe/transcript_qc:2.0.0"
+    container "altoslabscom/transcript_qc:2.0.0"
 
     input:
     tuple val(meta), val(parameters), path(input_files)

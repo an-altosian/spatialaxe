@@ -12,3 +12,6 @@ null/
 .nf-test-*
 .mypy_cache/
 .vscode/
+
+# spatialqc wheel copied into a module dir as Docker build context (build artefact)
+modules/local/*/spatialqc-*.whl
