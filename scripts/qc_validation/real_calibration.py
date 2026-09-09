@@ -17,6 +17,7 @@ The only difference between the two feature tables is which operator produced
 dapi_lap_var.
 """
 
+import os
 import sys
 from pathlib import Path
 
@@ -24,11 +25,10 @@ import numpy as np
 import pandas as pd
 import tifffile
 
-SRC = (
-    "/home/projects/nextflow-tower-pipeline-dev/nf-core/spatialxe"
-    "/.claude/worktrees/spatialqc-package/packages/spatialqc/src"
-)
-sys.path.insert(0, SRC)
+# Import spatialqc the way any consumer does: from the installed package.
+# SPATIALQC_SRC lets you point at a working copy without installing it.
+if os.environ.get("SPATIALQC_SRC"):
+    sys.path.insert(0, os.environ["SPATIALQC_SRC"])
 
 import logging  # noqa: E402
 
@@ -45,10 +45,8 @@ from spatialqc.image.qc import (  # noqa: E402
     fit_focus_gmm_2d,
 )
 
-REAL = Path(
-    "/tmp/claude-470214627/-home-projects-nextflow-tower-pipeline-dev-nf-core-spatialxe"
-    "/b9aed468-da0b-44bc-b7da-e6019628d1a5/scratchpad/real"
-)
+# Where the DAPI channels were downloaded to. Override with SPATIALQC_BUNDLES.
+REAL = Path(os.environ.get("SPATIALQC_BUNDLES", "./bundles"))
 SAMPLES = {
     "v1_R2_control": REAL / "v1_R2_control_dapi.ome.tif",
     "atera_breast": REAL / "atera_breast_dapi.ome.tif",

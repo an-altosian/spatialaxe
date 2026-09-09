@@ -13,8 +13,8 @@ multiples of the stride) but wrong for centroids, which fall anywhere inside a
 tile: every cell past the half-stride mark was pushed into the next tile.
 Measured on four calibration samples, that misassigned 73.5-73.9% of cells and
 inflated `pct_blurred_gmm_2d_roi` by 2x to 14x while depressing
-`ccfs_gmm_agreement_pct` by 10-19 points. See
-`docs/plans/2026-08-24_SPIKE_tile-mapping-impact.md`.
+`ccfs_gmm_agreement_pct` by 10-19 points. The calibration write-up lives
+with the pipeline that owns those samples, not in this package.
 
 These tests assert the two paths agree rather than pinning tile IDs the tests
 themselves compute, so they cannot enshrine the same off-by-half error, and they

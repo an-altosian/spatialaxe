@@ -101,8 +101,7 @@ def test_a_perfectly_constant_distribution_raises() -> None:
     Unreachable on real data -- a sample where every cell has an identical
     molecule count does not occur -- so it is recorded as a defect rather than
     corrected here: changing the arithmetic during a mechanical port would make
-    the move unverifiable against historical QC reports. See
-    docs/plans/2026-09-09_PLAN_spatialqc-extraction-and-followups.md.
+    the move unverifiable against historical QC reports.
     """
     with pytest.raises(IndexError):
         estimate_min_mols_per_cell([100] * 100)
