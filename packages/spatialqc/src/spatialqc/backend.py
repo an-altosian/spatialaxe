@@ -106,6 +106,11 @@ def available_gpu_ids(max_gpus: int | None = None) -> list[int]:
             many GPUs to reserve -- it does not restrict what CUDA can see, so a
             task asking for one GPU that lands on a four-GPU instance would
             otherwise detect and use all four.
+            ``0`` and ``None`` both mean "no cap", matching
+            :func:`spatialqc.image.qc.resolve_available_gpus` and the
+            ``--max-gpus`` default. Selecting the CPU is the ``device``
+            selector's job, not this one's: keeping one control point is why
+            ``--max-gpus 0`` does not mean "no GPUs".
 
     Returns:
         Device IDs, or an empty list when no GPU is usable.
@@ -127,7 +132,7 @@ def available_gpu_ids(max_gpus: int | None = None) -> list[int]:
         )
         return []
     ids = list(range(n_devices))
-    if max_gpus is not None:
+    if max_gpus:
         ids = ids[:max_gpus]
     return ids
 
@@ -227,6 +232,22 @@ class NumpyBackend:
 class CupyBackend:
     """GPU backend built on ``cupyx.scipy.ndimage``.
 
+    Every method scopes its work to ``device_id`` (see :meth:`_on_device`), so
+    the backend is safe to use on any device.
+
+    **Invariant for callers.** The arrays returned by these methods live on
+    ``device_id``, which is *not* the process's current device. Reading one with
+    a raw CuPy call outside a ``with cupy.cuda.Device(device_id)`` block is an
+    unrecoverable ``cudaErrorIllegalAddress`` that kills the interpreter -- not
+    a catchable exception. Demonstrated: with a backend on device 1,
+    ``backend.to_numpy(result).mean()`` returns normally while
+    ``float(result.mean())`` aborts the process.
+
+    So bring results back through :meth:`to_numpy` before touching them with
+    anything other than this class. This matters for the migration of the
+    remaining direct ``cp.`` dispatch sites onto the protocol: they are the
+    callers most likely to reach for a bare reduction on a returned array.
+
     Args:
         device_id: CUDA device to bind to. Multi-GPU runs create one backend per
             device and shard tiles across them.
@@ -244,18 +265,31 @@ class CupyBackend:
         self.device_id = device_id
         self._device = _cp.cuda.Device(device_id)
 
-    def to_device(self, image: NDArray[Any]) -> Any:
+    def _on_device(self, fn: Any, *args: Any, **kwargs: Any) -> Any:
+        """Run *fn* with this backend's device current.
+
+        Every operation has to go through here. CuPy dispatches to whichever
+        device is *current*, not to the one the array actually lives on, so an
+        unwrapped call raises "the device where the array resides (N) is
+        different from the current device (0)" as soon as ``device_id`` is not
+        zero -- which is exactly the documented multi-GPU pattern of one backend
+        per device. A single-GPU run never reaches it, so this is only
+        observable on a multi-GPU host.
+        """
         with self._device:
-            return _cp.asarray(image)
+            return fn(*args, **kwargs)
+
+    def to_device(self, image: NDArray[Any]) -> Any:
+        return self._on_device(_cp.asarray, image)
 
     def to_numpy(self, array: Any) -> NDArray[np.float32]:
-        return _cp.asnumpy(array).astype(np.float32)
+        return self._on_device(_cp.asnumpy, array).astype(np.float32)
 
     def uniform_filter(self, array: Any, size: int) -> Any:
-        return _cupy_uniform_filter(array, size=size)
+        return self._on_device(_cupy_uniform_filter, array, size=size)
 
     def laplace(self, array: Any) -> Any:
-        return _cupy_laplace(array)
+        return self._on_device(_cupy_laplace, array)
 
     def gaussian_laplace(self, array: Any, sigma: float) -> Any:
         # Uses cupyx's fused Gaussian-second-derivative filter, matching
@@ -271,7 +305,7 @@ class CupyBackend:
         # reduction of this response, GPU tiles scored systematically lower than
         # CPU tiles, and the GPU-OOM fallback switched operators mid-run, so one
         # sample could be graded on two different scales.
-        return _cupy_gaussian_laplace(array, sigma=sigma)
+        return self._on_device(_cupy_gaussian_laplace, array, sigma=sigma)
 
     def synchronize(self) -> None:
         self._device.synchronize()

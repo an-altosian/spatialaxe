@@ -23,6 +23,11 @@ from spatialqc.backend import (
 
 requires_gpu = pytest.mark.skipif(not HAS_CUPY, reason="CuPy is not installed")
 
+requires_multi_gpu = pytest.mark.skipif(
+    len(available_gpu_ids()) < 2,
+    reason="needs at least two CUDA devices",
+)
+
 
 # ---------------------------------------------------------------------------
 # Selector semantics
@@ -68,8 +73,23 @@ def test_available_gpu_ids_respects_the_cap() -> None:
     # max_gpus exists because an AWS Batch accelerator request does not restrict
     # what CUDA can see: a task asking for one GPU on a four-GPU instance would
     # otherwise use all four.
-    assert available_gpu_ids(max_gpus=0) == []
     assert len(available_gpu_ids(max_gpus=1)) <= 1
+
+
+def test_max_gpus_zero_means_no_cap_not_no_gpus() -> None:
+    """``0`` must mean "no cap", agreeing with ``resolve_available_gpus``.
+
+    These two functions disagreed: ``available_gpu_ids(0)`` sliced to ``[]``
+    while ``resolve_available_gpus("auto", 0)`` treated ``0`` as falsy and
+    returned every device. ``--max-gpus`` defaults to ``0`` and is documented as
+    "use every device", so swapping one function for the other during the
+    Backend-protocol migration would have made every default run silently
+    CPU-only -- correct-looking output at roughly 50x the cost.
+
+    Requesting the CPU is the ``device`` selector's job; that single control
+    point is the whole reason ``--max-gpus 0`` does not mean "no GPUs".
+    """
+    assert available_gpu_ids(max_gpus=0) == available_gpu_ids(max_gpus=None)
 
 
 def test_gpu_ids_empty_without_cupy() -> None:
@@ -245,3 +265,59 @@ def test_fused_log_differs_materially_from_the_shim_it_replaced(
 @pytest.mark.gpu
 def test_gpu_synchronize_is_callable() -> None:
     CupyBackend().synchronize()
+
+
+@requires_multi_gpu
+@pytest.mark.gpu
+def test_every_op_runs_on_the_bound_device() -> None:
+    """A backend bound to a non-zero device must work, not raise.
+
+    CuPy dispatches to whichever device is *current*, not to the one the array
+    lives on. Only ``to_device`` entered ``with self._device``, so on the
+    documented multi-GPU pattern -- one backend per device, tiles sharded across
+    them -- device 0 worked and every other device raised "The device where the
+    array resides (1) is different from the current device (0)".
+
+    This is invisible on a single-GPU host, which is why it survived review:
+    the bug needs two devices to show itself.
+    """
+    image = np.random.default_rng(0).random((128, 128)).astype(np.float32)
+
+    for device_id in available_gpu_ids()[:2]:
+        backend = CupyBackend(device_id=device_id)
+        array = backend.to_device(image)
+        # Each of these dispatches through cupyx and so must be device-scoped.
+        smoothed = backend.uniform_filter(array, size=9)
+        lap = backend.laplace(array)
+        log = backend.gaussian_laplace(array, sigma=1.0)
+        backend.synchronize()
+
+        for name, result in (("uniform_filter", smoothed), ("laplace", lap), ("log", log)):
+            host = backend.to_numpy(result)
+            assert host.shape == image.shape, f"{name} on device {device_id}"
+            assert np.isfinite(host).all(), f"{name} on device {device_id}"
+
+
+@requires_multi_gpu
+@pytest.mark.gpu
+def test_results_are_identical_across_devices() -> None:
+    """Sharding tiles across devices must not change the numbers.
+
+    Image QC shards tiles over the available GPUs, so two tiles of one sample
+    can be graded on different devices. Identical input must therefore give
+    bit-identical output regardless of which device computed it.
+    """
+    image = np.random.default_rng(1).random((128, 128)).astype(np.float32)
+    ids = available_gpu_ids()[:2]
+
+    outputs = []
+    for device_id in ids:
+        backend = CupyBackend(device_id=device_id)
+        result = backend.gaussian_laplace(backend.to_device(image), sigma=1.0)
+        outputs.append(backend.to_numpy(result))
+
+    np.testing.assert_array_equal(
+        outputs[0],
+        outputs[1],
+        err_msg=f"devices {ids[0]} and {ids[1]} disagree on the same input",
+    )
