@@ -1090,6 +1090,11 @@ def compute_roi_snr(
             roi_id_is_arange=roi_id_is_arange,
         )
     else:
+        # The XOR check at the top of the function already guarantees this:
+        # transcripts_path is None here, so df_tx cannot be. mypy cannot follow
+        # the invariant through that check, and the alternative -- annotating
+        # df_tx as non-optional -- would be a lie about the signature.
+        assert df_tx is not None
         counters = (
             np.zeros(n_rois, dtype=np.int64),
             np.zeros(n_rois, dtype=np.int64),
