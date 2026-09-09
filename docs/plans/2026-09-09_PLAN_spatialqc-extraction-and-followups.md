@@ -73,6 +73,27 @@ Sequence:
 
 ## 3. Extracting to a standalone repository
 
+> **Done 2026-09-09.** The package now lives at <https://github.com/altos-labs/spatialqc> (internal), default branch `main`, six commits.
+>
+> The split was re-run from the post-fix HEAD, so `main` carries the device-scoping and `max_gpus` fixes and the GPU validation scripts — the pre-existing `spatialqc-standalone` branch predates all of them and is **superseded; do not push it**.
+>
+> Verified after pushing, not assumed:
+>
+> | Check                                    | Result                                                        |
+> | ---------------------------------------- | ------------------------------------------------------------- |
+> | Fresh `git clone`                        | `pyproject.toml`, `src/`, `tests/`, `.github/` at root         |
+> | `python -m build --wheel` from the clone | `spatialqc-0.1.0-py3-none-any.whl`                            |
+> | Package data in the wheel                | both threshold YAMLs (20952 / 17981 bytes) and `py.typed`      |
+> | Test suite from the clone                | 247 passed, 1 skipped                                          |
+> | Stray artefacts                          | no `build/`, `egg-info`, `__pycache__` or `.ruff_cache`        |
+>
+> The `.gitignore` `data/` trap noted in section 4.1 did not bite: both YAMLs travel in the wheel from a clean checkout.
+>
+> The repo's **first CI run** caught five mypy errors in `image/snr.py` that had never been type-checked before — fixed in `9fc1982`, and pre-existing rather than introduced by the port. Everything else passed on the first run: wheel build, py3.10/3.11/3.12 tests, cheap-import, ruff check and ruff format.
+>
+> Still open, and both need a human: publishing 0.1.0 to PyPI, and the container rebuild in section 2.
+> Until 0.1.0 is published, do **not** remove `packages/spatialqc/` from this repository — the module `environment.yml` pins `spatialqc==0.1.0` from PyPI, which does not exist yet, so the in-tree copy is still the only working source.
+
 The package was developed in-tree so the existing test suite could gate every step.
 Extract it with `git subtree split`, which rewrites the commits touching that subdirectory so its contents sit at the repository root:
 
