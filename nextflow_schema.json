@@ -477,8 +477,8 @@
                 },
                 "image_qc_snr_no_moran": {
                     "type": "boolean",
-                    "default": true,
-                    "description": "Disable Moran's I spatial autocorrelation (default). Set false to opt in."
+                    "default": false,
+                    "description": "When true, SNR neg-spatial is quadrant-only (no Moran). Default false enables Moran's I (requires PySAL/esda in container)."
                 },
                 "image_qc_save_dapi_maps_tiff": {
                     "type": "boolean",
