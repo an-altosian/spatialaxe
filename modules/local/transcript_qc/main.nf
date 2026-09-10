@@ -10,8 +10,12 @@ process TRANSCRIPT_QC_PROCESSING {
     // script on PATH. Added as a pure file-copy layer, since the wheel is
     // py3-none-any and needs no build step. 0.0.11 already carried every
     // dependency (scanpy, anndata, pyarrow, h5py, scipy, seaborn, quarto).
+    // The `docker.io/` prefix is required, not cosmetic: nextflow.config sets
+    // `docker.registry = 'quay.io'` (the nf-core template default), so a bare
+    // name resolves to quay.io/altoslabscom/... and Wave rejects it with
+    // "does not exist or access is not authorized".
     // To be migrated to the nf-core org before release.
-    container "altoslabscom/xenium-processing:0.0.12"
+    container "docker.io/altoslabscom/xenium-processing:0.0.12"
 
     input:
     tuple val(meta), val(parameters), path(input_files)

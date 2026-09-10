@@ -14,8 +14,12 @@ process IMAGE_QC_ANALYSIS {
     // PATH. Added as a pure file-copy layer, since the wheel is py3-none-any and
     // needs no build step. 0.0.15 already carried every dependency (scanpy,
     // tifffile, cupy, zarr, numba, nsitk, skimage, sklearn, quarto).
+    // The `docker.io/` prefix is required, not cosmetic: nextflow.config sets
+    // `docker.registry = 'quay.io'` (the nf-core template default), so a bare
+    // name resolves to quay.io/altoslabscom/... and Wave rejects it with
+    // "does not exist or access is not authorized".
     // To be migrated to the nf-core org before release.
-    container "altoslabscom/xenium-processing-gpu:0.0.16"
+    container "docker.io/altoslabscom/xenium-processing-gpu:0.0.16"
 
     input:
     tuple val(meta), val(parameters), path(input_files)
