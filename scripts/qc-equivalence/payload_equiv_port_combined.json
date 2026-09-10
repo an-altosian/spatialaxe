@@ -1,0 +1,13 @@
+{
+    "launch": {
+        "computeEnvId": "4WpM1mBmA2qSC6CxukQ1yx",
+        "pipeline": "https://github.com/altos-labs/spatialxe",
+        "revision": "882ed8a6616aaaa42916ef42eaba451a3e73871f",
+        "workDir": "s3://altos-lab-nextflow/scratch",
+        "configText": "process {\n  resourceLimits = [ cpus: 94, memory: 760.GB, time: 72.h ]\n  errorStrategy = 'retry'\n  queue = 'TowerForge-4WpM1mBmA2qSC6CxukQ1yx'\n  withLabel:process_gpu_qc {\n    cpus   = 30\n    memory = { 180.GB * (Math.pow(2, task.attempt - 1) as int) }\n    time   = { 4.h * (Math.pow(2, task.attempt - 1) as int) }\n    queue  = 'TowerForge-4WpM1mBmA2qSC6CxukQ1yx'\n    accelerator = { params.use_gpu ? (params.image_qc_gpus as int) : null }\n    container = 'docker.io/altoslabscom/xenium-processing-gpu@sha256:2d1b38ae1a4a412da05f6f8466c1b98225a844a2d81cfc801f15b0ba56e76b3a'\n  }\n}\n",
+        "paramsText": "{\n  \"input\": \"s3://altos-lab-bioinf/SDI/pipelines/spatialxe/samplesheets/spatialqc_verify_1sample.csv\",\n  \"outdir\": \"s3://altos-lab-bioinf/SDI/pipelines/spatialxe/results/equiv_combined_port\",\n  \"mode\": \"qc\",\n  \"run_qc\": true,\n  \"image_qc_gpus\": 1,\n  \"image_qc_snr_no_moran\": false,\n  \"gpu_queue\": \"TowerForge-4WpM1mBmA2qSC6CxukQ1yx\",\n  \"cellpose_queue\": \"TowerForge-4WpM1mBmA2qSC6CxukQ1yx\"\n}",
+        "configProfiles": ["gpu", "aws"],
+        "resume": false,
+        "runName": "equiv-combined-port"
+    }
+}

@@ -1,0 +1,37 @@
+==============================================================================
+REF : /tmp/claude-470214627/-home-projects-nextflow-tower-pipeline-dev-nf-core-spatialxe/5d972f74-9724-42bd-868e-67c8c58354be/scratchpad/out/ref  (54 files)
+PORT: /tmp/claude-470214627/-home-projects-nextflow-tower-pipeline-dev-nf-core-spatialxe/5d972f74-9724-42bd-868e-67c8c58354be/scratchpad/out/port  (54 files)
+==============================================================================
+
+## 0. SANITY (are these real outputs at all?)
+  ref: roi_qc_metrics.json:total_rois = 712236 (expect 712236) ok
+  port: roi_qc_metrics.json:total_rois = 712236 (expect 712236) ok
+  ref: roi_qc_metrics.json:blur_gmm_1d.rois_blurred_gmm = 489659 (expect 487910) *** MISMATCH
+  port: roi_qc_metrics.json:blur_gmm_1d.rois_blurred_gmm = 489659 (expect 487910) *** MISMATCH
+  ref: roi_qc_metrics.json:blur_gmm_1d.total_rois_tissue_filtered = 343489 (expect 343489) ok
+  port: roi_qc_metrics.json:blur_gmm_1d.total_rois_tissue_filtered = 343489 (expect 343489) ok
+  ref: image_qc_metrics.json:total_cells = 126045 (expect 126045) ok
+  port: image_qc_metrics.json:total_cells = 126045 (expect 126045) ok
+  ref: image_qc_metrics.json has 51 top-level keys (expect 40)
+  port: image_qc_metrics.json has 51 top-level keys (expect 40)
+  ref: snr_metrics.json:verdict.overall_snr_verdict = 'WARN'
+  port: snr_metrics.json:verdict.overall_snr_verdict = 'WARN'
+  ref: blur_gmm_1d.pct_blurred_gmm_tissue_filtered = 35.22849348887446 (GPU baseline 34.69194064438745; a float-rounding gap here is CPU-vs-GPU reduction order, NOT a ref-vs-port defect)
+  port: blur_gmm_1d.pct_blurred_gmm_tissue_filtered = 35.22849348887446 (GPU baseline 34.69194064438745; a float-rounding gap here is CPU-vs-GPU reduction order, NOT a ref-vs-port defect)
+  *** sanity assertions FAILED - a 'no diff' verdict below would be meaningless
+
+## 1. FILE-SET DIFFERENCES
+  none - identical file sets
+
+## 2. JSON METRICS
+  no numeric differences in any shared JSON
+
+## 3. TABLES
+  all 5 shared table(s) match exactly
+
+## 4. FIGURES (dimensions only; byte differences are expected)
+  40 shared figure(s), 0 with differing dimensions
+
+==============================================================================
+VERDICT: NOT numerically identical - see differences above.
+==============================================================================

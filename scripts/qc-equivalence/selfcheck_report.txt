@@ -1,0 +1,187 @@
+==============================================================================
+REF : /tmp/claude-470214627/-home-projects-nextflow-tower-pipeline-dev-nf-core-spatialxe/5d972f74-9724-42bd-868e-67c8c58354be/scratchpad/selfcheck/cpu  (6 files)
+PORT: /tmp/claude-470214627/-home-projects-nextflow-tower-pipeline-dev-nf-core-spatialxe/5d972f74-9724-42bd-868e-67c8c58354be/scratchpad/selfcheck/gpu  (6 files)
+==============================================================================
+
+## 0. SANITY (are these real outputs at all?)
+  ref: roi_qc_metrics.json:total_rois = 712236 (expect 712236) ok
+  port: roi_qc_metrics.json:total_rois = 712236 (expect 712236) ok
+  ref: image_qc_metrics.json:total_cells = 126045 (expect 126045) ok
+  port: image_qc_metrics.json:total_cells = 126045 (expect 126045) ok
+  [info] ref: blur_gmm_2d.rois_blurred_gmm = 487910 (matches baseline 487910)
+  [info] port: blur_gmm_2d.rois_blurred_gmm = 487910 (matches baseline 487910)
+  [info] ref: blur_gmm_2d.pct_blurred_gmm_tissue_filtered = 34.69194064438745 (matches baseline 34.69194064438745)
+  [info] port: blur_gmm_2d.pct_blurred_gmm_tissue_filtered = 34.69194064438745 (matches baseline 34.69194064438745)
+  [info] ref: blur_gmm_1d.total_rois_tissue_filtered = 343489 (matches baseline 343489)
+  [info] port: blur_gmm_1d.total_rois_tissue_filtered = 343489 (matches baseline 343489)
+  [info] ref: image_qc_metrics.json has 51 top-level keys
+  [info] port: image_qc_metrics.json has 51 top-level keys
+  ref: snr_metrics.json:verdict.overall_snr_verdict = 'WARN'
+  port: snr_metrics.json:verdict.overall_snr_verdict = 'WARN'
+  ref: blur_gmm_1d.pct_blurred_gmm_tissue_filtered = 35.22849348887446 (GPU baseline 34.69194064438745; a float-rounding gap here is CPU-vs-GPU reduction order, NOT a ref-vs-port defect)
+  port: blur_gmm_1d.pct_blurred_gmm_tissue_filtered = 35.22849348887446 (GPU baseline 34.69194064438745; a float-rounding gap here is CPU-vs-GPU reduction order, NOT a ref-vs-port defect)
+
+## 1. FILE-SET DIFFERENCES
+  none - identical file sets
+
+## 2. JSON METRICS
+
+  [DIFF] image_qc_cell_metrics.json
+  ccfs_vs_rfs_correlation: ref=0.7312612809788905 port=0.7312612830777436
+  mean_blur_prob_gmm_2d_roi: ref=0.018856629504237776 port=0.018856626436431947
+  mean_ccfs_dapi: ref=0.24663663256663068 port=0.24663663140884537
+  mean_dapi_rfs_roi: ref=1711.1936275508635 port=1711.1935907708908
+  mean_dapi_rfsnorm_roi: ref=1.8654749720573607 port=1.8654759894411366
+  median_blur_prob_gmm_2d_roi: ref=9.714386661619016e-08 port=9.714365363497352e-08
+  median_dapi_rfs_roi: ref=1572.1795654296875 port=1572.178466796875
+  median_dapi_rfsnorm_roi: ref=1.713821066648346 port=1.7138208400507344
+
+  [DIFF] image_qc_metrics.json
+  mean_ccfs_dapi: ref=0.24663663256663068 port=0.24663663140884537
+  median_ccfs_dapi: ref=0.2416948762666546 port=0.241694860678203
+  median_intensity_DAPI: ref=3217.2749 port=3217.2748
+  pct_cells_below_intensity_DAPI: ref=0.4776 port=0.0
+  pct_cells_below_intensity_IntRNA: ref=89.215 port=1.4336
+
+  [DIFF] intensity_assessment.json
+  boundary.mean: ref=436.9176862295681 port=436.9176863623011
+  boundary.p10: ref=8.357387542724624 port=8.357387733459486
+  boundary.p25: ref=142.7248992919922 port=142.7249298095703
+  boundary.p75: ref=628.140380859375 port=628.1404418945312
+  boundary.p90: ref=819.172900390625 port=819.1728393554688
+  boundary.pct_warn_threshold: ref=15.0 port=40.0
+  boundary.quality_status: ref='warn' port='pass'
+  dapi.critical_threshold: ref=500.0 port=50.0
+  dapi.mean: ref=1296.8535975839245 port=1296.8536050515168
+  dapi.median: ref=661.06201171875 port=661.0620727539062
+  dapi.n_tissue_rois_below_critical: ref=156196 port=39436
+  dapi.p10: ref=45.44146804809571 port=45.44147262573242
+  dapi.p25: ref=114.15673828125 port=114.15672302246094
+  dapi.p75: ref=2103.16162109375 port=2103.161865234375
+  dapi.p90: ref=3563.54814453125 port=3563.54853515625
+  dapi.pct_tissue_roi_below_critical: ref=45.47336304801609 port=11.481008125442154
+  dapi.pct_warn_threshold: ref=15.0 port=40.0
+  dapi.quality_status: ref='warn' port='pass'
+  intrna.critical_threshold: ref=300.0 port=20.0
+  intrna.mean: ref=85.40933956742276 port=85.40934032391422
+  intrna.median: ref=44.39836883544922 port=44.39836502075195
+  intrna.n_tissue_rois_below_critical: ref=325480 port=106273
+  intrna.p10: ref=1.9640816450119019 port=1.9640817642211914
+  intrna.p25: ref=13.282448768615723 port=13.282449722290039
+  intrna.p75: ref=101.5738754272461 port=101.57389068603516
+  intrna.p90: ref=200.1067779541016 port=200.10678405761723
+  intrna.pct_tissue_roi_below_critical: ref=94.75703734326281 port=30.939273164497262
+  intrna.pct_warn_threshold: ref=15.0 port=40.0
+  intrna.quality_status: ref='warn' port='pass'
+  overall_quality: ref='warn' port='pass'
+
+  [DIFF] roi_blur_threshold.json
+  gmm_1d.component_means_log1p_focus[0]: ref=7.348521641932073 port=7.3485216193924305
+  gmm_1d.component_means_log1p_focus[1]: ref=5.259022347206184 port=5.259022341349989
+  gmm_1d.component_weights[0]: ref=0.8042404039638226 port=0.8042404037908926
+  gmm_1d.component_weights[1]: ref=0.19575959603617743 port=0.1957595962091075
+  gmm_2d.component_means[0][0]: ref=7.293557514087467 port=7.293557519132704
+  gmm_2d.component_means[0][1]: ref=8.593199251314797 port=8.593199595609926
+  gmm_2d.component_means[1][0]: ref=3.198930203958465 port=3.198930467462194
+  gmm_2d.component_means[1][1]: ref=3.115428059050039 port=3.1154281320721466
+  gmm_2d.component_weights[0]: ref=0.6551936635785995 port=0.6551936564342157
+  gmm_2d.component_weights[1]: ref=0.34480633642140035 port=0.3448063435657843
+  roi_focus_score_threshold: ref=100.48368453979495 port=100.48365745544436
+
+  [DIFF] roi_qc_metrics.json
+  KEY MISSING IN PORT: snr.components.SNR_roi_neg_spatial.moran_note (ref='skipped (Moran disabled; quadrant summary only)')
+  KEY ADDED IN PORT:   snr.components.SNR_roi_neg_spatial.method_secondary (port='moran_knn4')
+  KEY ADDED IN PORT:   snr.components.SNR_roi_neg_spatial.moran_i (port=-0.00021797113894864514)
+  KEY ADDED IN PORT:   snr.components.SNR_roi_neg_spatial.moran_p_sim (port=0.24)
+  KEY ADDED IN PORT:   snr.components.SNR_roi_neg_spatial.moran_subsample.n_available (port=304363)
+  KEY ADDED IN PORT:   snr.components.SNR_roi_neg_spatial.moran_subsample.n_used (port=25000)
+  KEY ADDED IN PORT:   snr.components.SNR_roi_neg_spatial.moran_subsample.seed (port=42)
+  KEY ADDED IN PORT:   snr.components.SNR_roi_neg_spatial.moran_verdict (port='PASS')
+  blur_gmm_1d.blur_prob_mean: ref=0.20079975849560927 port=0.20079975768297018
+  blur_gmm_1d.blur_prob_median: ref=0.040649323808920446 port=0.04064933031350128
+  blur_gmm_2d.blur_prob_mean: ref=0.3482084047733798 port=0.3482084130175132
+  blur_gmm_2d.blur_prob_median: ref=0.0009894757150466778 port=0.0009894745727806792
+  focus_score.max: ref=6506.65478515625 port=6506.65576171875
+  focus_score.mean: ref=578.9574256038793 port=578.9574174572831
+  focus_score.median: ref=1.1997243165969849 port=1.1997199058532715
+  focus_score.std: ref=983.8615003770161 port=983.8614850391458
+  focus_score_norm.max: ref=7.096963079743616 port=7.096968154761625
+  focus_score_norm.mean: ref=0.6302902774251368 port=0.6302906290253318
+  focus_score_norm.min: ref=-0.0013088091611012523 port=-0.0013088050878753696
+  focus_score_norm.std: ref=1.073319034326805 port=1.0733196232732487
+  intensity_quality.boundary.mean: ref=436.9176862295681 port=436.9176863623011
+  intensity_quality.boundary.p10: ref=8.357387542724624 port=8.357387733459486
+  intensity_quality.boundary.p25: ref=142.7248992919922 port=142.7249298095703
+  intensity_quality.boundary.p75: ref=628.140380859375 port=628.1404418945312
+  intensity_quality.boundary.p90: ref=819.172900390625 port=819.1728393554688
+  intensity_quality.boundary.pct_warn_threshold: ref=15.0 port=40.0
+  intensity_quality.boundary.quality_status: ref='warn' port='pass'
+  intensity_quality.dapi.critical_threshold: ref=500.0 port=50.0
+  intensity_quality.dapi.mean: ref=1296.8535975839245 port=1296.8536050515168
+  intensity_quality.dapi.median: ref=661.06201171875 port=661.0620727539062
+  intensity_quality.dapi.n_tissue_rois_below_critical: ref=156196 port=39436
+  intensity_quality.dapi.p10: ref=45.44146804809571 port=45.44147262573242
+  intensity_quality.dapi.p25: ref=114.15673828125 port=114.15672302246094
+  intensity_quality.dapi.p75: ref=2103.16162109375 port=2103.161865234375
+  intensity_quality.dapi.p90: ref=3563.54814453125 port=3563.54853515625
+  intensity_quality.dapi.pct_tissue_roi_below_critical: ref=45.47336304801609 port=11.481008125442154
+  intensity_quality.dapi.pct_warn_threshold: ref=15.0 port=40.0
+  intensity_quality.dapi.quality_status: ref='warn' port='pass'
+  intensity_quality.intrna.critical_threshold: ref=300.0 port=20.0
+  intensity_quality.intrna.mean: ref=85.40933956742276 port=85.40934032391422
+  intensity_quality.intrna.median: ref=44.39836883544922 port=44.39836502075195
+  intensity_quality.intrna.n_tissue_rois_below_critical: ref=325480 port=106273
+  intensity_quality.intrna.p10: ref=1.9640816450119019 port=1.9640817642211914
+  intensity_quality.intrna.p25: ref=13.282448768615723 port=13.282449722290039
+  intensity_quality.intrna.p75: ref=101.5738754272461 port=101.57389068603516
+  intensity_quality.intrna.p90: ref=200.1067779541016 port=200.10678405761723
+  intensity_quality.intrna.pct_tissue_roi_below_critical: ref=94.75703734326281 port=30.939273164497262
+  intensity_quality.intrna.pct_warn_threshold: ref=15.0 port=40.0
+  intensity_quality.intrna.quality_status: ref='warn' port='pass'
+  intensity_quality.overall_quality: ref='warn' port='pass'
+  laplacian_sharpness.component_separation: ref=4.256319042365243 port=4.25631919446298
+  laplacian_sharpness.focus_lap_spearman_corr: ref=0.8325647537228898 port=0.832564757910699
+  laplacian_sharpness.lap_var_median_raw: ref=2066.907470703125 port=2066.908203125
+  raw_intensity.max: ref=10551.7900390625 port=10551.7880859375
+  raw_intensity.mean: ref=631.1431282367496 port=631.1431317370775
+  raw_intensity.median: ref=30.958775520324707 port=30.95877742767334
+  raw_intensity.std: ref=1213.1260012825803 port=1213.1260075377197
+  snr.components.SNR_image_otsu.snr_db_mean: ref=18.306684511945072 port=18.30668544139606
+  snr.components.SNR_image_otsu.snr_db_median: ref=17.168245769467212 port=17.168245821328256
+  snr.components.SNR_image_otsu.snr_db_p25: ref=15.879302352631122 port=15.879302088317553
+  snr.components.SNR_image_otsu.snr_db_p75: ref=19.17016899238429 port=19.170169292981726
+  snr.components.SNR_image_roi_quartile_db.mean_foreground: ref=3432.7182281277724 port=3432.7182471130964
+  snr.components.SNR_image_roi_quartile_db.snr_db: ref=45.5558348366424 port=45.55583460798132
+  snr.components.SNR_image_roi_quartile_db.std_background: ref=18.106996362612538 port=18.106996939434023
+  stain_percentiles_whole_grid.boundary.p95: ref=813.8459167480469 port=813.8458862304688
+  stain_percentiles_whole_grid.boundary.p99: ref=1313.5879028320314 port=1313.588024902344
+  stain_percentiles_whole_grid.dapi.p95: ref=3516.5134887695312 port=3516.5133056640625
+  stain_percentiles_whole_grid.dapi.p99: ref=5237.01318359376 port=5237.013012695323
+  stain_percentiles_whole_grid.intrna.p99: ref=528.5052734375008 port=528.5052337646492
+
+  [DIFF] snr_metrics.json
+  KEY MISSING IN PORT: components.SNR_roi_neg_spatial.moran_note (ref='skipped (Moran disabled; quadrant summary only)')
+  KEY ADDED IN PORT:   components.SNR_roi_neg_spatial.method_secondary (port='moran_knn4')
+  KEY ADDED IN PORT:   components.SNR_roi_neg_spatial.moran_i (port=-0.00021797113894864514)
+  KEY ADDED IN PORT:   components.SNR_roi_neg_spatial.moran_p_sim (port=0.24)
+  KEY ADDED IN PORT:   components.SNR_roi_neg_spatial.moran_subsample.n_available (port=304363)
+  KEY ADDED IN PORT:   components.SNR_roi_neg_spatial.moran_subsample.n_used (port=25000)
+  KEY ADDED IN PORT:   components.SNR_roi_neg_spatial.moran_subsample.seed (port=42)
+  KEY ADDED IN PORT:   components.SNR_roi_neg_spatial.moran_verdict (port='PASS')
+  components.SNR_image_otsu.snr_db_mean: ref=18.306684511945072 port=18.30668544139606
+  components.SNR_image_otsu.snr_db_median: ref=17.168245769467212 port=17.168245821328256
+  components.SNR_image_otsu.snr_db_p25: ref=15.879302352631122 port=15.879302088317553
+  components.SNR_image_otsu.snr_db_p75: ref=19.17016899238429 port=19.170169292981726
+  components.SNR_image_roi_quartile_db.mean_foreground: ref=3432.7182281277724 port=3432.7182471130964
+  components.SNR_image_roi_quartile_db.snr_db: ref=45.5558348366424 port=45.55583460798132
+  components.SNR_image_roi_quartile_db.std_background: ref=18.106996362612538 port=18.106996939434023
+
+## 3. TABLES
+  no shared tables
+
+## 4. FIGURES (dimensions only; byte differences are expected)
+  0 shared figure(s), 0 with differing dimensions
+
+==============================================================================
+VERDICT: NOT numerically identical - see differences above.
+==============================================================================

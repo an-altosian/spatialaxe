@@ -1,0 +1,120 @@
+==============================================================================
+REF : /tmp/claude-470214627/-home-projects-nextflow-tower-pipeline-dev-nf-core-spatialxe/5d972f74-9724-42bd-868e-67c8c58354be/scratchpad/gpufinal2/ref  (55 files)
+PORT: /tmp/claude-470214627/-home-projects-nextflow-tower-pipeline-dev-nf-core-spatialxe/5d972f74-9724-42bd-868e-67c8c58354be/scratchpad/gpufinal/port  (55 files)
+==============================================================================
+
+## 0. SANITY (are these real outputs at all?)
+  ok  roi_qc_metrics.json:total_rois = 712236 on both sides
+  ok  image_qc_metrics.json:total_cells = 126045 on both sides
+  [info] ref: blur_gmm_2d.rois_blurred_gmm = 489100 (differs from baseline 487910)
+  [info] port: blur_gmm_2d.rois_blurred_gmm = 487910 (matches baseline 487910)
+  [info] ref: blur_gmm_2d.pct_blurred_gmm_tissue_filtered = 35.03838550870625 (differs from baseline 34.69194064438745)
+  [info] port: blur_gmm_2d.pct_blurred_gmm_tissue_filtered = 34.69194064438745 (matches baseline 34.69194064438745)
+  [info] ref: blur_gmm_1d.total_rois_tissue_filtered = 343489 (matches baseline 343489)
+  [info] port: blur_gmm_1d.total_rois_tissue_filtered = 343489 (matches baseline 343489)
+  [info] ref: image_qc_metrics.json has 51 top-level keys
+  [info] port: image_qc_metrics.json has 51 top-level keys
+  ref: snr_metrics.json:verdict.overall_snr_verdict = 'WARN'
+  port: snr_metrics.json:verdict.overall_snr_verdict = 'WARN'
+  ref: blur_gmm_1d.pct_blurred_gmm_tissue_filtered = 35.22849348887446 (GPU baseline 34.69194064438745; a float-rounding gap here is CPU-vs-GPU reduction order, NOT a ref-vs-port defect)
+  port: blur_gmm_1d.pct_blurred_gmm_tissue_filtered = 35.22849348887446 (GPU baseline 34.69194064438745; a float-rounding gap here is CPU-vs-GPU reduction order, NOT a ref-vs-port defect)
+
+## 1. FILE-SET DIFFERENCES
+  none - identical file sets
+
+## 2. JSON METRICS
+
+  [DIFF] image_qc_cell_metrics.json
+  cells_blurred_gmm_2d_roi: ref=2284 port=2118
+  cells_high_focus_gmm_2d_roi: ref=123761 port=123927
+  classification_agreement_gmm_2d: ref=0.9831012733547543 port=0.9843389265738427
+  classification_agreement_gmm_2d_count: ref=123915 port=124071
+  classification_disagreement_gmm_2d_count: ref=2130 port=1974
+  mean_blur_prob_gmm_2d_roi: ref=0.020618048468761526 port=0.018856626436431947
+  median_blur_prob_gmm_2d_roi: ref=4.201112546092903e-07 port=9.714365363497352e-08
+
+  [DIFF] image_qc_metrics.json
+  ccfs_gmm_agreement_pct: ref=98.3101 port=98.4339
+  cells_blurred_gmm_2d_roi: ref=2280 port=2114
+  cluster_blur.1.n_blurred: ref=774 port=718
+  cluster_blur.1.pct_blurred: ref=1.83 port=1.7
+  cluster_blur.10.n_blurred: ref=79 port=74
+  cluster_blur.10.pct_blurred: ref=16.77 port=15.71
+  cluster_blur.2.n_blurred: ref=459 port=429
+  cluster_blur.2.pct_blurred: ref=1.87 port=1.75
+  cluster_blur.3.n_blurred: ref=274 port=254
+  cluster_blur.3.pct_blurred: ref=1.7 port=1.57
+  cluster_blur.4.n_blurred: ref=160 port=148
+  cluster_blur.4.pct_blurred: ref=1.6 port=1.48
+  cluster_blur.5.n_blurred: ref=93 port=85
+  cluster_blur.5.pct_blurred: ref=1.03 port=0.94
+  cluster_blur.6.n_blurred: ref=158 port=147
+  cluster_blur.6.pct_blurred: ref=1.76 port=1.64
+  cluster_blur.7.n_blurred: ref=128 port=117
+  cluster_blur.7.pct_blurred: ref=1.9 port=1.74
+  cluster_blur.8.n_blurred: ref=141 port=129
+  cluster_blur.8.pct_blurred: ref=2.9 port=2.65
+  cluster_blur.9.n_blurred: ref=18 port=17
+  cluster_blur.9.pct_blurred: ref=0.58 port=0.55
+  cluster_blur_outliers.10.n_blurred: ref=79 port=74
+  cluster_blur_outliers.10.pct_blurred: ref=16.77 port=15.71
+  pct_blurred_gmm_2d_roi: ref=1.8089 port=1.6772
+  pct_blurred_gmm_2d_roi_all_cells: ref=1.8121 port=1.6804
+
+  [DIFF] roi_blur_threshold.json
+  gmm_2d.component_means[0][0]: ref=7.301565870266528 port=7.293557519132704
+  gmm_2d.component_means[0][1]: ref=8.543363176465187 port=8.593199595609926
+  gmm_2d.component_means[1][0]: ref=3.235007328885287 port=3.198930467462194
+  gmm_2d.component_means[1][1]: ref=2.991532717765199 port=3.1154281320721466
+  gmm_2d.component_weights[0]: ref=0.6508443887780668 port=0.6551936564342157
+  gmm_2d.component_weights[1]: ref=0.34915561122193317 port=0.3448063435657843
+  gmm_2d.fraction_rois_blurred_gmm: ref=68.67105846938374 port=68.50397901819059
+
+  [DIFF] roi_qc_metrics.json
+  blur_gmm_2d.blur_prob_mean: ref=0.35247613062125155 port=0.3482084130175132
+  blur_gmm_2d.blur_prob_median: ref=0.0017807149773211867 port=0.0009894745727806792
+  blur_gmm_2d.pct_blurred_gmm: ref=68.67105846938374 port=68.50397901819059
+  blur_gmm_2d.pct_blurred_gmm_tissue_filtered: ref=35.03838550870625 port=34.69194064438745
+  blur_gmm_2d.rois_blurred_gmm: ref=489100 port=487910
+  blur_gmm_2d.rois_blurred_gmm_tissue_filtered: ref=120353 port=119163
+  gmm_comparison.agreement_pct: ref=97.35382654064102 port=97.33753980422219
+  gmm_comparison.both_blurred: ref=479956 port=479303
+  gmm_comparison.both_in_focus: ref=213433 port=213970
+  gmm_comparison.only_1d_blurred: ref=9703 port=10356
+  gmm_comparison.only_2d_blurred: ref=9144 port=8607
+  laplacian_sharpness.component_separation: ref=4.24394139034082 port=4.25631919446298
+  laplacian_sharpness.focus_lap_spearman_corr: ref=0.8334719347367797 port=0.832564757910699
+  laplacian_sharpness.lap_var_median_raw: ref=1926.1181640625 port=2066.908203125
+  morphology.cluster_zone_bad_fraction: ref=0.001280576176304639 port=0.0012750445297547268
+  morphology.usable_tissue_frac: ref=0.6495550075839401 port=0.6530136336243664
+  snr.components.SNR_roi_neg_spatial.moran_p_sim: ref=0.26 port=0.21
+
+  [DIFF] snr_metrics.json
+  components.SNR_roi_neg_spatial.moran_p_sim: ref=0.26 port=0.21
+
+## 3. TABLES
+
+  [DIFF] SNR_roi_tx.parquet
+  COL dapi_lap_var: 602504/712236 rows differ, max|delta|=28709.4
+  COL blur_prob_gmm_2d: 311581/712236 rows differ, max|delta|=0.38566
+  COL is_blurred_gmm_2d: 1206/712236 rows differ, max|delta|=1
+
+  [DIFF] grid_roi_focus_scores.csv
+  COL dapi_lap_var: 602504/712236 rows differ, max|delta|=28709.4
+  COL blur_prob_gmm_2d: 311581/712236 rows differ, max|delta|=0.38566
+  COL is_blurred_gmm_2d: 1206/712236 rows differ, max|delta|=1
+
+  [DIFF] image_qc_cell_metrics.csv
+  COL is_blurred_gmm_2d_roi: 166/126045 rows differ, max|delta|=1
+  COL blur_prob_gmm_2d_roi: 126026/126045 rows differ, max|delta|=0.38566
+
+  [DIFF] image_qc_metrics.csv
+  COL is_blurred_gmm_2d_roi: 166/126045 rows differ, max|delta|=1
+  COL blur_prob_gmm_2d_roi: 126026/126045 rows differ, max|delta|=0.38566
+
+## 4. FIGURES (dimensions only; byte differences are expected)
+  40 shared figure(s), 0 with differing dimensions
+
+==============================================================================
+VERDICT: NOT numerically identical - see differences above.
+==============================================================================

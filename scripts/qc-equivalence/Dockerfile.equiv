@@ -1,0 +1,39 @@
+# An image built for one purpose: make a GPU A/B between nf-xenium-processing
+# dev HEAD and the spatialqc port a *controlled* comparison.
+#
+# Neither published 0.0.16 image can run both scripts. The ECR one has no
+# spatialqc wheel. This Docker Hub one has spatialqc, but its baked
+# xenium_helpers predates read_xenium_analysis_sw_version, so the reference
+# image_qc.py dies on import. That mutual exclusivity is what blocked the test,
+# and it is all this image fixes.
+FROM docker.io/altoslabscom/xenium-processing-gpu:0.0.16
+
+# Every install below is --no-deps, deliberately and non-negotiably. This image
+# exists to compare numbers, so the numeric stack must stay bit-identical to the
+# base: numpy 2.2.6, scipy 1.16.2, scikit-learn 1.7.2, pandas 2.3.2,
+# tifffile 2025.9.20, numba 0.62.0. Letting pip resolve dependencies would be
+# free to nudge any one of them and silently invalidate the very comparison the
+# image is built to run. --force-reinstall is equally deliberate: the port
+# reports the same version string (0.1.0) as the baked wheel while having
+# different content, so a version-based decision would skip the replacement.
+
+# 1. xenium_helpers at nf-xenium-processing origin/dev (cd87a5d), taken from the
+#    git object store rather than a working tree. This is the fix that lets the
+#    reference script run at all.
+COPY xenium_helpers /build/xenium_helpers
+RUN /opt/conda/bin/python3 -m pip install --no-deps --force-reinstall /build/xenium_helpers
+
+# 2. spatialqc at spatialxe feat/spatialqc-package (882ed8a), replacing the
+#    stale baked 0.1.0 so the port under test is the code that actually runs.
+COPY spatialqc /build/spatialqc
+RUN /opt/conda/bin/python3 -m pip install --no-deps --force-reinstall /build/spatialqc
+
+RUN rm -rf /build
+
+# Provenance in the image itself, because two different builds already ship
+# under the single string "0.1.0" and that is how this investigation lost time.
+LABEL org.opencontainers.image.base.name="docker.io/altoslabscom/xenium-processing-gpu:0.0.16" \
+      com.altoslabs.xenium-helpers.commit="cd87a5d" \
+      com.altoslabs.spatialqc.commit="882ed8a" \
+      com.altoslabs.purpose="controlled GPU equivalence A/B; numeric stack pinned to base via --no-deps"
+RUN printf 'xenium_helpers: nf-xenium-processing origin/dev cd87a5d\nspatialqc: spatialxe feat/spatialqc-package 882ed8a\nbase: altoslabscom/xenium-processing-gpu:0.0.16\ninstalled with: pip install --no-deps --force-reinstall\n' > /etc/spatialqc-equiv-provenance.txt

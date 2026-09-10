@@ -1,0 +1,37 @@
+==============================================================================
+REF : /tmp/claude-470214627/-home-projects-nextflow-tower-pipeline-dev-nf-core-spatialxe/5d972f74-9724-42bd-868e-67c8c58354be/scratchpad/final/ref  (55 files)
+PORT: /tmp/claude-470214627/-home-projects-nextflow-tower-pipeline-dev-nf-core-spatialxe/5d972f74-9724-42bd-868e-67c8c58354be/scratchpad/final/port  (55 files)
+==============================================================================
+
+## 0. SANITY (are these real outputs at all?)
+  ok  roi_qc_metrics.json:total_rois = 712236 on both sides
+  ok  image_qc_metrics.json:total_cells = 126045 on both sides
+  [info] ref: blur_gmm_2d.rois_blurred_gmm = 487910 (matches baseline 487910)
+  [info] port: blur_gmm_2d.rois_blurred_gmm = 487910 (matches baseline 487910)
+  [info] ref: blur_gmm_2d.pct_blurred_gmm_tissue_filtered = 34.69194064438745 (matches baseline 34.69194064438745)
+  [info] port: blur_gmm_2d.pct_blurred_gmm_tissue_filtered = 34.69194064438745 (matches baseline 34.69194064438745)
+  [info] ref: blur_gmm_1d.total_rois_tissue_filtered = 343489 (matches baseline 343489)
+  [info] port: blur_gmm_1d.total_rois_tissue_filtered = 343489 (matches baseline 343489)
+  [info] ref: image_qc_metrics.json has 51 top-level keys
+  [info] port: image_qc_metrics.json has 51 top-level keys
+  ref: snr_metrics.json:verdict.overall_snr_verdict = 'WARN'
+  port: snr_metrics.json:verdict.overall_snr_verdict = 'WARN'
+  ref: blur_gmm_1d.pct_blurred_gmm_tissue_filtered = 35.22849348887446 (GPU baseline 34.69194064438745; a float-rounding gap here is CPU-vs-GPU reduction order, NOT a ref-vs-port defect)
+  port: blur_gmm_1d.pct_blurred_gmm_tissue_filtered = 35.22849348887446 (GPU baseline 34.69194064438745; a float-rounding gap here is CPU-vs-GPU reduction order, NOT a ref-vs-port defect)
+
+## 1. FILE-SET DIFFERENCES
+  none - identical file sets
+
+## 2. JSON METRICS
+  no numeric differences in any shared JSON
+
+## 3. TABLES
+  all 5 shared table(s) match exactly
+
+## 4. FIGURES (dimensions only; byte differences are expected)
+  40 shared figure(s), 0 with differing dimensions
+
+==============================================================================
+VERDICT: numerically identical across all shared JSONs and tables,
+         and both trees pass the content sanity assertions.
+==============================================================================
