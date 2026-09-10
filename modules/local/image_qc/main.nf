@@ -90,7 +90,7 @@ process IMAGE_QC_ANALYSIS {
     if (task.ext.snr_otsu_max_rois != null) {
         args << "--snr-otsu-max-rois ${task.ext.snr_otsu_max_rois}"
     }
-    // snr_no_moran true (default): Moran off — no flag. false: opt in to Moran.
+    // snr_no_moran false (default, per upstream): Moran on. true forces quadrant-only.
     if (!task.ext.snr_no_moran) {
         args << '--snr-with-moran'
     }
