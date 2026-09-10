@@ -1288,7 +1288,23 @@ def compute_neg_spatial_autocorrelation(
             neighbors = {i: [int(j) for j in idx[i][1:]] for i in range(len(xy))}
 
             w = W(neighbors, silence_warnings=True)
-            mi = Moran(z_m, w, permutations=int(moran_permutations))
+            # esda's Moran draws its permutations from numpy's *legacy* global
+            # RNG (np.random.permutation) and exposes no seed argument, so
+            # moran_subsample_seed reached the subsample above but never the
+            # permutation test. p_sim was therefore irreproducible run to run --
+            # 0.34, 0.16, 0.22, 0.26 and 0.27 were observed across five runs on
+            # one unchanged sample, all reporting "seed": 42 -- while moran_i,
+            # which does not depend on the permutations, was always exact.
+            #
+            # Seed the legacy stream for the call and restore the caller's state
+            # afterwards, so p_sim is deterministic without perturbing any other
+            # consumer of np.random.
+            _np_state = np.random.get_state()
+            np.random.seed(moran_subsample_seed)
+            try:
+                mi = Moran(z_m, w, permutations=int(moran_permutations))
+            finally:
+                np.random.set_state(_np_state)
             moran_i = float(mi.I)
             p_sim = float(mi.p_sim) if mi.p_sim is not None else float("nan")
             m_warn = float(_ns.get("moran_warn", 0.5))
