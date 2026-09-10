@@ -1115,8 +1115,17 @@ def compute_roi_snr(
     df["snr_real_tx"] = real_c
     df["snr_neg_tx"] = neg_c
     df["snr_total_tx"] = total_c
-    df["neg_pct"] = np.where(
-        total_c > 0, neg_c.astype(np.float64) / total_c.astype(np.float64), np.nan
+    # `np.where` would evaluate both branches, so the 0/0 for empty tiles is
+    # computed and then thrown away -- correct result, but it emits
+    # "RuntimeWarning: invalid value encountered in divide" on every real
+    # sample. Guarding the division instead matches the `ratio` computation
+    # immediately below and keeps the log clean, so a genuine numerical warning
+    # is not lost in the noise.
+    df["neg_pct"] = np.divide(
+        neg_c.astype(np.float64),
+        total_c.astype(np.float64),
+        out=np.full(n_rois, np.nan, dtype=np.float64),
+        where=total_c > 0,
     )
 
     ratio = np.divide(
